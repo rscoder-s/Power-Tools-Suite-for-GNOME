@@ -1,0 +1,318 @@
+#!/bin/bash
+
+# ==============================================================================
+# Title:        Quick Print
+# Description:  Libadwaita Universal Print Dialog with option to choose printers.
+# ==============================================================================
+
+# --- 1. ERROR LOGGING ---
+exec 2> /tmp/quick_print_debug.log
+
+# --- 2. DEPENDENCY CHECK ---
+check_dep() {
+    if ! command -v "$1" &> /dev/null; then
+        zenity --error --text="Missing Tool: <b>$1</b>" --width=300
+        exit 1
+    fi
+}
+check_dep python3
+check_dep lp
+check_dep lpstat
+check_dep file
+
+# --- 3. INPUT & SAFETY VALIDATION ---
+
+# A. BATCH CHECK: Prevent multi-file selection
+if [ $# -gt 1 ]; then
+    zenity --info \
+        --title="Selection Error" \
+        --text="<b>Batch Printing Not Supported</b>\n\nTo prevent accidental waste of paper, please select <b>only one file</b> at a time." \
+        --width=350
+    exit 0
+fi
+
+FILE_PATH="$1"
+
+# B. FOLDER CHECK: Block directories
+if [ -d "$FILE_PATH" ]; then
+    zenity --error \
+        --title="Cannot Print Folder" \
+        --text="<b>Folders cannot be printed directly.</b>\n\nPlease open the folder and select a specific document." \
+        --width=350
+    exit 1
+fi
+
+# C. MIME CHECK: Filter unsafe types
+MIME_TYPE=$(file --brief --mime-type "$FILE_PATH")
+
+case "$MIME_TYPE" in
+    # Block Audio & Video
+    audio/*|video/*)
+        zenity --error --text="<b>Cannot Print Media</b>\n\nPrinters cannot print sound or video files.\nType: $MIME_TYPE" --width=350
+        exit 1
+        ;;
+
+    # Block Executables & Binaries
+    application/x-executable|application/x-sharedlib|application/x-pie-executable|application/x-dosexec|application/x-object)
+        zenity --error --text="<b>Cannot Print Programs</b>\n\nThis is a binary application, not a document." --width=350
+        exit 1
+        ;;
+
+    # Block Archives (Zip, Tar, Iso)
+    application/zip|application/x-tar|application/gzip|application/x-7z-compressed|application/x-rar|application/x-iso9660-image)
+        zenity --error --text="<b>Cannot Print Archives</b>\n\nPlease extract the file first to print its contents." --width=350
+        exit 1
+        ;;
+
+    # Allow everything else (Images, PDFs, Text, Office Docs)
+    *)
+        # Pass
+        ;;
+esac
+# --- 4. THE GUI ENGINE ---
+GUI_SCRIPT=$(mktemp)
+cat <<'EOF' > "$GUI_SCRIPT"
+import sys
+import os
+import subprocess
+import threading
+import gi
+
+# Force Versions
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+
+# CRITICAL IMPORTS
+from gi.repository import Gtk, Adw, GLib, Gio, Gdk
+
+APP_ID = 'com.quick.print.native'
+
+# SAFETY: Check args before accessing
+if len(sys.argv) < 2:
+    print("Error: No file path provided to Python script.")
+    sys.exit(1)
+
+TARGET_FILE = sys.argv[1]
+
+class QuickPrintApp(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID)
+        self.selected_printer = None
+        self.printers = []
+
+    def do_activate(self):
+        win = Adw.ApplicationWindow(application=self)
+        win.set_title("Quick Print")
+        win.set_default_size(420, 550)
+        
+        # --- VIEW STACK ---
+        self.stack = Adw.ViewStack()
+        
+        # --- HEADER ---
+        header = Adw.HeaderBar()
+        header.set_show_end_title_buttons(False)
+        
+        toolbar_view = Adw.ToolbarView()
+        toolbar_view.add_top_bar(header)
+        toolbar_view.set_content(self.stack)
+        win.set_content(toolbar_view)
+
+        # ===========================
+        # PAGE 1: SELECTION
+        # ===========================
+        page_select = Adw.StatusPage()
+        page_select.set_title("Print Document")
+        page_select.set_description(os.path.basename(TARGET_FILE))
+        
+        # Try to get system icon for file type
+        try:
+            f = Gio.File.new_for_path(TARGET_FILE)
+            info = f.query_info("standard::icon", 0, None)
+            gicon = info.get_icon()
+            
+            texture = Gtk.IconTheme.get_for_display(Gdk.Display.get_default()).lookup_by_gicon(
+                gicon, 128, 1, Gtk.TextDirection.NONE
+            )
+            page_select.set_paintable(texture)
+        except:
+            page_select.set_icon_name("text-x-generic-symbolic")
+
+        # Container
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
+        clamp = Adw.Clamp(maximum_size=360)
+        clamp.set_child(box)
+        page_select.set_child(clamp)
+
+        # 1. PRINTER LIST
+        grp_printers = Adw.PreferencesGroup(title="Select Printer")
+        box.append(grp_printers)
+
+        self.fetch_printers()
+        
+        if not self.printers:
+            # Error State if no printers
+            row = Adw.ActionRow(title="No Printers Found")
+            row.set_subtitle("Check system settings.")
+            row.add_css_class("error")
+            grp_printers.add(row)
+        else:
+            first_radio = None
+            default_p = self.get_default_printer()
+            
+            for p in self.printers:
+                row = Adw.ActionRow(title=p)
+                radio = Gtk.CheckButton()
+                if first_radio: radio.set_group(first_radio)
+                else: first_radio = radio
+                
+                # Auto-select default
+                if p == default_p:
+                    radio.set_active(True)
+                    self.selected_printer = p
+                
+                radio.connect("toggled", self.on_printer_toggled, p)
+                row.add_prefix(radio)
+                row.add_suffix(Gtk.Image.new_from_icon_name("printer-symbolic"))
+                row.set_activatable_widget(radio)
+                grp_printers.add(row)
+                
+            # If default wasn't found in list, select first
+            if self.selected_printer is None and self.printers:
+                first_radio.set_active(True)
+                self.selected_printer = self.printers[0]
+
+        # 2. BUTTONS
+        self.btn_print = Gtk.Button(label="Print")
+        self.btn_print.add_css_class("suggested-action")
+        self.btn_print.add_css_class("pill")
+        self.btn_print.connect("clicked", self.on_print_clicked)
+        if not self.printers: self.btn_print.set_sensitive(False)
+        box.append(self.btn_print)
+
+        btn_cancel = Gtk.Button(label="Cancel")
+        btn_cancel.add_css_class("flat")
+        btn_cancel.connect("clicked", lambda x: self.quit())
+        box.append(btn_cancel)
+
+        self.stack.add_named(page_select, "select")
+
+        # ===========================
+        # PAGE 2: PROGRESS
+        # ===========================
+        self.page_progress = Adw.StatusPage()
+        self.page_progress.set_icon_name("printer-printing-symbolic")
+        self.page_progress.set_title("Sending...")
+        self.page_progress.set_description("Queueing print job...")
+        
+        self.spinner = Gtk.Spinner()
+        self.spinner.set_size_request(64, 64)
+        self.page_progress.set_child(self.spinner)
+        
+        self.stack.add_named(self.page_progress, "progress")
+
+        # ===========================
+        # PAGE 3: SUCCESS
+        # ===========================
+        page_success = Adw.StatusPage()
+        page_success.set_icon_name("printer-symbolic")
+        page_success.set_title("Job Sent")
+        page_success.set_description("Document sent to printer.")
+        
+        btn_close = Gtk.Button(label="Close")
+        btn_close.add_css_class("suggested-action")
+        btn_close.add_css_class("pill")
+        btn_close.set_halign(Gtk.Align.CENTER)
+        btn_close.connect("clicked", lambda x: self.quit())
+        
+        page_success.set_child(btn_close)
+        
+        self.stack.add_named(page_success, "success")
+
+        win.present()
+
+    def fetch_printers(self):
+        try:
+            # Try lpstat -e (modern) first
+            out = subprocess.check_output(["lpstat", "-e"], text=True).strip()
+            if not out:
+                # Fallback to lpstat -a (legacy)
+                out = subprocess.check_output(["lpstat", "-a"], text=True).strip()
+                self.printers = [line.split()[0] for line in out.splitlines() if line]
+            else:
+                self.printers = [line for line in out.splitlines() if line]
+        except: self.printers = []
+
+    def get_default_printer(self):
+        try:
+            out = subprocess.check_output(["lpstat", "-d"], text=True).strip()
+            if ": " in out: return out.split(": ")[1]
+        except: pass
+        return None
+
+    def on_printer_toggled(self, widget, printer_name):
+        if widget.get_active(): self.selected_printer = printer_name
+
+    def on_print_clicked(self, btn):
+        self.stack.set_visible_child_name("progress")
+        self.spinner.start()
+        thread = threading.Thread(target=self.run_print_job)
+        thread.start()
+
+    def run_print_job(self):
+        try:
+            cmd = ["lp", "-d", self.selected_printer, TARGET_FILE]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                GLib.idle_add(self.on_success)
+            else:
+                err_msg = result.stderr.strip()
+                if "format-not-supported" in err_msg:
+                    nice = "Printer cannot handle this file format.\nConvert to PDF."
+                else: nice = err_msg
+                GLib.idle_add(self.on_error, nice)
+        except Exception as e:
+            GLib.idle_add(self.on_error, str(e))
+
+    def on_success(self):
+        self.spinner.stop()
+        self.stack.set_visible_child_name("success")
+        GLib.timeout_add(2000, self.quit)
+
+    def on_error(self, msg):
+        self.spinner.stop()
+        self.page_progress.set_icon_name("dialog-error-symbolic")
+        self.page_progress.set_title("Print Failed")
+        self.page_progress.set_description(str(msg))
+        self.page_progress.set_child(None)
+        
+        # Add close button to error page
+        btn_err = Gtk.Button(label="Close")
+        btn_err.add_css_class("pill")
+        btn_err.set_halign(Gtk.Align.CENTER)
+        btn_err.connect("clicked", lambda x: self.quit())
+        self.page_progress.set_child(btn_err)
+
+if __name__ == "__main__":
+    app = QuickPrintApp()
+    app.run(None)
+EOF
+
+# --- 5. EXECUTION ---
+# FIX: Explicitly pass the FILE_PATH argument to python!
+python3 "$GUI_SCRIPT" "$FILE_PATH" >> /tmp/quick_print_debug.log 2>&1
+EXIT_CODE=$?
+
+# --- 6. CLEANUP ---
+rm -f "$GUI_SCRIPT"
+
+# Crash Reporting
+if [ $EXIT_CODE -ne 0 ]; then
+    zenity --text-info \
+        --title="Quick Print Crashed" \
+        --text="The application failed to start.\n\n<b>Error Log:</b>" \
+        --filename="/tmp/quick_print_debug.log" \
+        --width=500 --height=400
+fi
+
+exit $EXIT_CODE

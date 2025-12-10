@@ -1,0 +1,174 @@
+#!/bin/bash
+
+# ==============================================================================
+# Title:        Universal Image Resizer
+# Description:  Batch resizer with Industry Standard Presets.
+# ==============================================================================
+
+set -u
+set -o pipefail
+
+# --- 1. PROCESS ISOLATION & SAFETY ---
+WORK_DIR=$(mktemp -d /tmp/img_resize_proc.XXXXXX)
+ACTIVE_FILE_LOG="${WORK_DIR}/atomic_write_lock.txt"
+SKIP_LOG="${WORK_DIR}/audit_skipped.txt"
+ERR_LOG="${WORK_DIR}/audit_failed.txt"
+
+# Cleanup Trap: Ensures no partial data remains on forced exit/cancel.
+cleanup() {
+    if [ -s "$ACTIVE_FILE_LOG" ]; then
+        rm -f "$(cat "$ACTIVE_FILE_LOG")"
+    fi
+    rm -rf "$WORK_DIR"
+}
+trap cleanup EXIT
+
+# --- 2. ENVIRONMENT CHECK ---
+REQUIRED_TOOLS=("zenity" "ffmpeg" "file")
+MISSING=""
+
+for tool in "${REQUIRED_TOOLS[@]}"; do
+    if ! command -v "$tool" &> /dev/null; then
+        MISSING="$MISSING $tool"
+    fi
+done
+
+if [ -n "$MISSING" ]; then
+    if command -v zenity &> /dev/null; then
+        zenity --error \
+        --title="System Check Failed" \
+        --text="Critical dependencies missing:\n<span font-family='monospace' color='red'>$MISSING</span>\n\nOperations cannot proceed."
+    fi
+    exit 1
+fi
+
+# --- 3. INPUT PRE-FLIGHT CHECK ---
+# Problem: User might right-click a PDF or Folder.
+# Solution: Scan selection. If NO images exist, abort before showing GUI.
+
+if [ -z "${1:-}" ]; then
+    zenity --info --title="Usage" --text="Select files -> Right Click -> Scripts -> Resize." --width=300
+    exit 0
+fi
+
+VALID_INPUT_FOUND=false
+
+for check_file in "$@"; do
+    if [ -f "$check_file" ]; then
+        mime_check=$(file --brief --mime-type "$check_file")
+        if [[ "$mime_check" == image/* ]]; then
+            VALID_INPUT_FOUND=true
+            break
+        fi
+    fi
+done
+
+if [ "$VALID_INPUT_FOUND" = false ]; then
+    zenity --error \
+    --title="Invalid Selection" \
+    --text="No supported image files detected in the current selection.\n\nOperation aborted." \
+    --width=350
+    exit 1
+fi
+
+# --- 4. PARAMETER SELECTION ---
+# Columns strictly defined using standard industry acronyms.
+SIZE_OPT=$(zenity --list --title="Resize Configuration" --text="Select target resolution constraints:" \
+    --radiolist --column="Select" --column="Standard" --column="Resolution" --column="Aspect" --height=350 --width=500 \
+    TRUE  "SD"             "854x480"   "16:9" \
+    FALSE "HD"             "1366x768"  "16:9" \
+    FALSE "FHD"            "1920x1080" "16:9" \
+    FALSE "FHD (Portrait)" "1080x1920" "9:16" \
+    FALSE "UHD"            "3840x2160" "16:9")
+
+if [ -z "$SIZE_OPT" ]; then exit 0; fi
+
+# Map selection to FFmpeg filter chains
+case "$SIZE_OPT" in
+    "SD")             SCALE="scale=w=854:h=480:force_original_aspect_ratio=decrease" ;;
+    "HD")             SCALE="scale=w=1366:h=768:force_original_aspect_ratio=decrease" ;;
+    "FHD")            SCALE="scale=w=1920:h=1080:force_original_aspect_ratio=decrease" ;;
+    "FHD (Portrait)") SCALE="scale=w=1080:h=1920:force_original_aspect_ratio=decrease" ;;
+    "UHD")            SCALE="scale=w=3840:h=2160:force_original_aspect_ratio=decrease" ;;
+esac
+
+# Clean variable for filename usage (Remove spaces/parentheses)
+SUFFIX=$(echo "$SIZE_OPT" | tr -d ' ()')
+
+# --- 5. BATCH PROCESSING ---
+(
+    count=0
+    total=$#
+    
+    for file in "$@"; do
+        ((count++))
+        
+        # Calculate completion percentage
+        percent=$(( 100 * (count - 1) / total ))
+        echo "$percent"
+        
+        filename=$(basename "$file")
+        
+        # A. MIME-TYPE INSPECTION
+        # Re-check is necessary because selection might be mixed (Images + Text files)
+        mime_type=$(file --brief --mime-type "$file")
+        
+        if [[ "$mime_type" != image/* ]]; then
+            echo "Bypassing: $filename [$mime_type]"
+            echo "$filename ($mime_type)" >> "$SKIP_LOG"
+            sleep 0.1
+            continue
+        fi
+
+        # B. INITIALIZATION
+        echo "# Processing: $filename"
+        
+        name="${filename%.*}"
+        ext="${filename##*.}"
+        
+        # Construct output filename: Image_FHDPortrait.jpg
+        new_filename="${name}_${SUFFIX}.${ext}"
+        
+        # LOCK: Register active write target
+        echo "$new_filename" > "$ACTIVE_FILE_LOG"
+
+        # C. TRANSCODING
+        if ! ffmpeg -i "$file" -vf "$SCALE" "$new_filename" -y -loglevel error 2>> "$ERR_LOG"; then
+             echo "ERR: $filename" >> "$ERR_LOG"
+             rm -f "$new_filename"
+        fi
+        
+        # UNLOCK: Clear active target
+        > "$ACTIVE_FILE_LOG"
+        
+    done
+    
+    echo "100"
+    echo "# Operations Complete"
+    sleep 0.5
+
+) | zenity --progress --title="Image Processor" --auto-close --width=500
+
+# --- 6. AUDIT REPORT ---
+
+if [ -s "$SKIP_LOG" ]; then
+    SKIP_COUNT=$(wc -l < "$SKIP_LOG")
+    SKIPPED_DETAILS=$(cat "$SKIP_LOG")
+    
+    zenity --warning \
+    --title="Input Filter Report" \
+    --text="<b>$SKIP_COUNT file(s) bypassed processing.</b>\n\nDetected non-image data types:\n<span font-family='monospace'>$SKIPPED_DETAILS</span>" \
+    --width=500
+fi
+
+if [ -s "$ERR_LOG" ]; then
+    RAW_ERRORS=$(tail -n 10 "$ERR_LOG")
+    zenity --error \
+    --title="Encoding Failure" \
+    --text="<b>Critical errors occurred.</b>\n\nDiagnostic log:\n<span font-family='monospace'>$RAW_ERRORS</span>" \
+    --width=600
+else
+    if [ ! -s "$SKIP_LOG" ]; then
+        notify-send "Task Complete" "Batch processing finished successfully." -i camera-photo
+    fi
+fi

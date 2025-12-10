@@ -1,0 +1,244 @@
+#!/bin/bash
+
+# ==============================================================================
+# Title:        Secure Delete
+# Description:  Native Libadwaita wrapper for shred with centred, clean layout and manual confirmation.
+# ==============================================================================
+
+# --- 1. ERROR LOGGING ---
+exec 2> /tmp/secure_delete.log
+
+# --- 2. DEPENDENCY CHECK ---
+check_dep() {
+    if ! command -v "$1" &> /dev/null; then
+        zenity --error --text="Missing Tool: <b>$1</b>" --width=300
+        exit 1
+    fi
+}
+check_dep python3
+check_dep shred
+
+# --- 3. INPUT VALIDATION ---
+if [ $# -eq 0 ]; then
+    zenity --error --text="No files selected." --width=300
+    exit 1
+fi
+# --- 3a. SAFETY CHECK: FILES ONLY ---
+for file in "$@"; do
+    if [ -d "$file" ]; then
+        zenity --error \
+            --title="Safety Restriction" \
+            --text="<b>Folder Detected:</b> $(basename "$file")\n\nShredding folders is unsafe on modern file systems.\n\nPlease select <b>only files</b>." \
+            --width=400
+        exit 1
+    fi
+done
+# --- 4. THE GUI ENGINE ---
+GUI_SCRIPT=$(mktemp)
+cat <<'EOF' > "$GUI_SCRIPT"
+import sys
+import os
+import subprocess
+import threading
+import gi
+
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+from gi.repository import Gtk, Adw, GLib, Gio, Pango
+
+APP_ID = 'com.secure.delete.native'
+
+class SecureDeleteApp(Adw.Application):
+    def __init__(self, target_files):
+        super().__init__(application_id=APP_ID)
+        self.target_files = target_files
+
+    def do_activate(self):
+        win = Adw.ApplicationWindow(application=self)
+        win.set_title("Secure Delete")
+        win.set_default_size(400, 550)
+        
+        # --- VIEW STACK ---
+        self.stack = Adw.ViewStack()
+        
+        # --- HEADER ---
+        header = Adw.HeaderBar()
+        header.set_show_end_title_buttons(False) 
+        
+        # --- TOOLBAR VIEW ---
+        toolbar_view = Adw.ToolbarView()
+        toolbar_view.add_top_bar(header)
+        toolbar_view.set_content(self.stack)
+        win.set_content(toolbar_view)
+
+        # ===========================
+        # PAGE 1: CONFIRMATION
+        # ===========================
+        page_confirm = Adw.StatusPage()
+        page_confirm.set_icon_name("user-trash-symbolic")
+        page_confirm.set_title("Permanently Shred?")
+        page_confirm.set_description("") 
+        
+        # Content Box
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
+        box.set_halign(Gtk.Align.CENTER)
+        
+        clamp = Adw.Clamp(maximum_size=320)
+        clamp.set_child(box)
+        page_confirm.set_child(clamp)
+
+        # 1. FILE INFO (Label)
+        # We use a Label with markup to mimic the "Info Box" look
+        lbl_info = Gtk.Label(label=self.get_file_summary())
+        lbl_info.set_use_markup(True)
+        lbl_info.set_wrap(True)
+        lbl_info.set_justify(Gtk.Justification.CENTER)
+        lbl_info.add_css_class("dim-label") # Native style for subtle text
+        box.append(lbl_info)
+
+        # 2. WARNING (Label)
+        # We use the "error" style class to make it red/orange native text
+        warn_text = "<b>Warning:</b> Data is overwritten 3 times.\nRecovery is physically impossible."
+        lbl_warn = Gtk.Label(label=warn_text)
+        lbl_warn.set_use_markup(True)
+        lbl_warn.set_wrap(True)
+        lbl_warn.set_justify(Gtk.Justification.CENTER)
+        lbl_warn.add_css_class("error") # Native destructive text style
+        box.append(lbl_warn)
+
+        # 3. SAFETY INPUT (Native EntryRow)
+        grp_input = Adw.PreferencesGroup()
+        self.row_entry = Adw.EntryRow(title="Type 'shred' to confirm")
+        self.row_entry.connect("changed", self.on_input_changed)
+        grp_input.add(self.row_entry)
+        
+        # Add some margin above input
+        grp_input.set_margin_top(10)
+        box.append(grp_input)
+
+        # 4. BUTTONS
+        self.btn_shred = Gtk.Button(label="Shred Forever")
+        self.btn_shred.add_css_class("destructive-action") # Native Red Pill
+        self.btn_shred.add_css_class("pill")
+        self.btn_shred.set_sensitive(False)
+        self.btn_shred.connect("clicked", self.on_shred_clicked)
+        self.btn_shred.set_margin_top(5)
+        box.append(self.btn_shred)
+
+        btn_cancel = Gtk.Button(label="Cancel")
+        btn_cancel.add_css_class("flat") # Makes it look like a link/secondary button
+        btn_cancel.connect("clicked", lambda x: self.quit())
+        box.append(btn_cancel)
+
+        self.stack.add_named(page_confirm, "confirm")
+
+        # ===========================
+        # PAGE 2: PROGRESS
+        # ===========================
+        self.page_progress = Adw.StatusPage()
+        self.page_progress.set_icon_name("system-run-symbolic")
+        self.page_progress.set_title("Shredding...")
+        self.page_progress.set_description("Please wait. Do not close.")
+        
+        self.spinner = Gtk.Spinner()
+        self.spinner.set_size_request(64, 64)
+        self.page_progress.set_child(self.spinner)
+        
+        self.stack.add_named(self.page_progress, "progress")
+
+        # ===========================
+        # PAGE 3: SUCCESS
+        # ===========================
+        page_success = Adw.StatusPage()
+        page_success.set_icon_name("object-select-symbolic")
+        page_success.set_title("Deleted")
+        page_success.set_description("Files have been permanently destroyed.")
+        
+        btn_close = Gtk.Button(label="Close")
+        btn_close.add_css_class("suggested-action")
+        btn_close.add_css_class("pill")
+        btn_close.set_halign(Gtk.Align.CENTER)
+        btn_close.connect("clicked", lambda x: self.quit())
+        
+        page_success.set_child(btn_close)
+        self.stack.add_named(page_success, "success")
+
+        win.present()
+
+    def get_file_summary(self):
+        count = len(self.target_files)
+        total_bytes = 0
+        for f in self.target_files:
+            try:
+                if os.path.isfile(f): total_bytes += os.path.getsize(f)
+                elif os.path.isdir(f):
+                    for r, d, subfiles in os.walk(f):
+                        for name in subfiles:
+                            total_bytes += os.path.getsize(os.path.join(r, name))
+            except: pass
+            
+        for unit in ['B', 'KiB', 'MiB', 'GiB']:
+            if total_bytes < 1024.0:
+                size_str = f"{total_bytes:.1f} {unit}"
+                break
+            total_bytes /= 1024.0
+            
+        if count == 1:
+            return f"<b>{os.path.basename(self.target_files[0])}</b>\n({size_str})"
+        else:
+            return f"<b>{count} Items Selected</b>\nTotal: {size_str}"
+
+    def on_input_changed(self, entry_row):
+        if entry_row.get_text().strip() == "shred":
+            self.btn_shred.set_sensitive(True)
+        else:
+            self.btn_shred.set_sensitive(False)
+
+    def on_shred_clicked(self, btn):
+        self.stack.set_visible_child_name("progress")
+        self.spinner.start()
+        thread = threading.Thread(target=self.run_logic)
+        thread.start()
+
+    def run_logic(self):
+        try:
+            for f in self.target_files:
+                filename = os.path.basename(f)
+                GLib.idle_add(self.page_progress.set_description, f"Overwriting: {filename}")
+                
+                if os.path.isdir(f):
+                    for root, dirs, files in os.walk(f, topdown=False):
+                        for name in files:
+                            subprocess.run(["shred", "-u", "-z", "-n", "3", os.path.join(root, name)], stderr=subprocess.DEVNULL)
+                        for name in dirs:
+                            os.rmdir(os.path.join(root, name))
+                    os.rmdir(f)
+                else:
+                    subprocess.run(["shred", "-u", "-z", "-n", "3", f], check=True)
+            
+            GLib.idle_add(self.on_complete)
+        except Exception as e:
+            GLib.idle_add(self.on_error, str(e))
+
+    def on_complete(self):
+        self.spinner.stop()
+        self.stack.set_visible_child_name("success")
+
+    def on_error(self, msg):
+        self.spinner.stop()
+        self.page_progress.set_icon_name("dialog-error-symbolic")
+        self.page_progress.set_title("Error")
+        self.page_progress.set_description(str(msg))
+
+if __name__ == "__main__":
+    target_files = sys.argv[1:]
+    app = SecureDeleteApp(target_files)
+    app.run([])
+EOF
+
+# --- 5. EXECUTION ---
+python3 "$GUI_SCRIPT" "$@"
+
+# --- 6. CLEANUP ---
+rm -f "$GUI_SCRIPT"
+exit 0

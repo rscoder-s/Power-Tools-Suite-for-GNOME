@@ -1,0 +1,512 @@
+#!/bin/bash
+
+# ==============================================================================
+# Title:        Send Over Local Network (QR)
+# Description:  An end-to-end encrypted file sharing app, optical-airgapped key transfer via QR code, using a sandboxed temporary python server
+# ==============================================================================
+
+# --- CONFIGURATION ---
+PORT=8836
+TIMEOUT_SECONDS=120
+APP_TITLE="Send over Local Network"
+LOCK_FILE="/tmp/send_local_v10.lock"
+MAGIC_TOKEN="__SECURE_BEAM_PROCESS__"
+# ---------------------
+
+# --- 0. HELPER FUNCTIONS ---
+check_dep() {
+    if ! command -v "$1" &> /dev/null; then
+        zenity --error --text="Missing Tool: <b>$1</b>" --width=300
+        exit 1
+    fi
+}
+
+get_local_ip() {
+    local ip=$(ip -4 route get 8.8.8.8 2>/dev/null | awk '{print $7}' | tr -d '\n')
+    if [ -z "$ip" ]; then
+        ip=$(hostname -I 2>/dev/null | grep -oE "\b([0-9]{1,3}\.){3}[0-9]{1,3}\b" | grep -v "127.0.0.1" | head -n 1)
+    fi
+    echo "$ip"
+}
+
+# --- 1. DEPENDENCIES & NETWORK ---
+check_dep zenity; check_dep openssl; check_dep qrencode; check_dep zip; check_dep curl; check_dep fuser
+
+IP_ADDR=$(get_local_ip)
+if [ -z "$IP_ADDR" ]; then
+    zenity --error --title="No Network" --text="<b>Network Error</b>\n\nPlease connect to Wi-Fi or Ethernet." --width=350
+    exit 1
+fi
+
+# --- 2. THE REAPER (Manual PID Hunting) ---
+# This looks for any process command line containing our MAGIC_TOKEN and kills it.
+kill_zombies() {
+    # 1. Kill old Bash Lock Owner
+    if [ -f "$LOCK_FILE" ]; then
+        local old_pid=$(cat "$LOCK_FILE")
+        if kill -0 "$old_pid" 2>/dev/null; then
+            kill -15 "$old_pid" 2>/dev/null
+            sleep 0.1
+            kill -9 "$old_pid" 2>/dev/null
+        fi
+        rm -f "$LOCK_FILE"
+    fi
+
+    # 2. Kill Python Orphans (The GUI/Server)
+    # We use pgrep to get PIDs, then kill them explicitly
+    for pid in $(pgrep -f "$MAGIC_TOKEN"); do
+        # Don't kill ourselves (current process)
+        if [ "$pid" != "$$" ]; then
+            kill -9 "$pid" 2>/dev/null
+        fi
+    done
+
+    # 3. Clear Port
+    if command -v fuser &> /dev/null; then
+        fuser -k -n tcp $PORT &> /dev/null
+    fi
+}
+
+# --- 3. CONFLICT DETECTION ---
+# If lock exists OR port busy OR magic token found
+if [ -f "$LOCK_FILE" ] || fuser -n tcp $PORT &> /dev/null || pgrep -f "$MAGIC_TOKEN" > /dev/null; then
+    
+    WARN_GUI=$(mktemp)
+    cat <<EOF > "$WARN_GUI"
+import sys, gi
+gi.require_version('Gtk', '4.0')
+from gi.repository import Gtk, Gdk
+
+def on_activate(app):
+    win = Gtk.ApplicationWindow(application=app)
+    win.set_default_size(380, 260)
+    win.set_icon_name("dialog-warning")
+    
+    header = Gtk.HeaderBar()
+    header.set_show_title_buttons(False)
+    win.set_titlebar(header)
+    win.set_title("Transfer Active")
+    
+    css = b"""
+    .container { padding: 20px; background-color: white; }
+    .msg { font-size: 14px; color: #2E3436; margin-bottom: 15px; }
+    .warning { background-color: #fff3cd; color: #856404; padding: 10px; border-radius: 6px; font-size: 12px; margin-bottom: 20px; }
+    .destructive { background-color: #d32f2f; color: white; font-weight: bold; padding: 10px; border-radius: 6px; }
+    .cancel { margin-top: 5px; }
+    """
+    provider = Gtk.CssProvider()
+    provider.load_from_data(css)
+    Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    box.add_css_class("container")
+    win.set_child(box)
+
+    box.append(Gtk.Label(label="Another transfer is currently running.", css_classes=["msg"]))
+    
+    warn = Gtk.Label(label="<b>Warning:</b> If a file is currently transferring, forcing a stop WILL corrupt the file on the receiving device.", use_markup=True, wrap=True)
+    warn.add_css_class("warning")
+    box.append(warn)
+
+    btn = Gtk.Button(label="Stop Previous & Start New")
+    btn.add_css_class("destructive")
+    btn.connect('clicked', lambda x: sys.exit(42))
+    box.append(btn)
+
+    btn_c = Gtk.Button(label="Cancel")
+    btn_c.add_css_class("cancel")
+    btn_c.connect('clicked', lambda x: sys.exit(0))
+    box.append(btn_c)
+    
+    win.present()
+
+app = Gtk.Application(application_id='com.secure.beam.conflict')
+app.connect('activate', on_activate)
+app.run(None)
+EOF
+    
+    python3 "$WARN_GUI"
+    EXIT_CODE=$?
+    rm -f "$WARN_GUI"
+
+    if [ $EXIT_CODE -eq 42 ]; then
+        kill_zombies
+        # Wait for port to actually free up
+        for i in {1..20}; do
+            if fuser -n tcp $PORT &> /dev/null; then sleep 0.1; else break; fi
+        done
+    else
+        exit 0
+    fi
+fi
+
+# Double check network one last time (in case user unplugged during warning)
+IP_ADDR=$(get_local_ip)
+if [ -z "$IP_ADDR" ]; then
+    zenity --error --text="<b>Network Lost.</b>\nPlease reconnect." --width=300
+    exit 1
+fi
+
+# Claim Lock
+echo $$ > "$LOCK_FILE"
+
+# --- 4. CLEANUP TRAP ---
+cleanup() {
+    # Kill using the specific PIDs we captured
+    if [ -n "$SERVER_PID" ]; then kill -9 "$SERVER_PID" 2>/dev/null; fi
+    if [ -n "$GUI_PID" ]; then kill -9 "$GUI_PID" 2>/dev/null; fi
+    
+    # Fallback cleanup
+    kill_zombies 2>/dev/null
+    
+    if [ "$KEEP_LOGS" != "true" ]; then
+        if [ -n "$SANDBOX_DIR" ]; then rm -rf "$SANDBOX_DIR"; fi
+    fi
+    rm -f "$LOCK_FILE"
+    exec 3>&-
+    rm -f "$PIPE"
+}
+trap cleanup EXIT
+
+# Init Progress
+PIPE=$(mktemp -u)
+mkfifo $PIPE
+zenity --progress --title="Initializing" --text="Starting..." --percentage=0 --auto-close --width=300 < $PIPE &
+exec 3> $PIPE
+
+echo "10" >&3
+echo "# System Check..." >&3
+
+# --- 5. FIREWALL CHECK ---
+if command -v firewall-cmd &> /dev/null && [[ "$(firewall-cmd --state 2>/dev/null)" == "running" ]]; then
+    if ! firewall-cmd --list-ports 2>/dev/null | grep -q "$PORT/tcp"; then
+        exec 3>&-
+        FW_GUI=$(mktemp)
+        cat <<EOF > "$FW_GUI"
+import sys, gi
+gi.require_version('Gtk', '4.0')
+from gi.repository import Gtk, Gdk
+
+def on_activate(app):
+    win = Gtk.ApplicationWindow(application=app)
+    win.set_default_size(420, 280)
+    win.set_icon_name("security-high")
+    
+    header = Gtk.HeaderBar()
+    win.set_titlebar(header)
+    win.set_title("Firewall Restriction")
+    
+    css = b"""
+    .container { padding: 25px; background-color: white; }
+    .title { font-size: 16px; font-weight: bold; color: #2E3436; margin-bottom: 10px; }
+    .msg { font-size: 13px; color: #555; margin-bottom: 20px; line-height: 1.5; }
+    .btn { background-color: #d32f2f; color: white; font-weight: bold; padding: 10px 20px; border-radius: 6px; }
+    """
+    provider = Gtk.CssProvider()
+    provider.load_from_data(css)
+    Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+    box.add_css_class("container")
+    win.set_child(box)
+
+    box.append(Gtk.Label(label="Port $PORT is Blocked", css_classes=["title"]))
+    msg = "Your system firewall is blocking the file transfer port.\\nTo fix this, please open your firewall settings and allow TCP Port $PORT."
+    box.append(Gtk.Label(label=msg, css_classes=["msg"], wrap=True))
+
+    btn = Gtk.Button(label="Close")
+    btn.add_css_class("btn")
+    btn.connect('clicked', lambda x: app.quit())
+    box.append(btn)
+
+    win.present()
+
+app = Gtk.Application(application_id='com.secure.beam.firewall')
+app.connect('activate', on_activate)
+app.run(None)
+EOF
+        python3 "$FW_GUI"
+        rm -f "$FW_GUI"
+        exit 1
+    fi
+fi
+
+# Ensure pipe is open
+exec 3> $PIPE
+
+# --- 6. INPUT ---
+SELECTED_FILES=("$@")
+if [ ${#SELECTED_FILES[@]} -eq 0 ]; then
+    FILE_PATH=$(zenity --file-selection --title="Select Files to Send" --multiple --separator="|")
+    if [ -z "$FILE_PATH" ]; then exit 0; fi
+    IFS="|" read -r -a SELECTED_FILES <<< "$FILE_PATH"
+fi
+
+HOST_NAME=$(hostname)
+
+# --- 7. PROCESSING ---
+echo "20" >&3
+echo "# Preparing Files..." >&3
+
+SANDBOX_DIR=$(mktemp -d)
+LOG_FILE="$SANDBOX_DIR/server.log"
+TARGET_FILE=""
+NEED_ZIP=false
+
+if [ ${#SELECTED_FILES[@]} -gt 1 ] || [ -d "${SELECTED_FILES[0]}" ]; then NEED_ZIP=true; fi
+
+if [ "$NEED_ZIP" = true ]; then
+    TARGET_FILE="$SANDBOX_DIR/Files_Bundle.zip"
+    STAGE_DIR="$SANDBOX_DIR/staging"
+    mkdir "$STAGE_DIR"
+    for f in "${SELECTED_FILES[@]}"; do cp -r "$f" "$STAGE_DIR/"; done
+    (cd "$STAGE_DIR" && zip -r -q "$TARGET_FILE" .)
+else
+    TARGET_FILE="${SELECTED_FILES[0]}"
+fi
+
+FILENAME=$(basename "$TARGET_FILE")
+BYTE_SIZE=$(stat -c%s "$TARGET_FILE")
+if command -v numfmt &> /dev/null; then
+    FILESIZE_HR=$(numfmt --to=iec-i --suffix=B --format="%.1f" "$BYTE_SIZE" | sed 's/\([A-Z]\)/ \1/')
+else
+    FILESIZE_HR=$(du -h "$TARGET_FILE" | cut -f1 | sed 's/K/ KiB/;s/M/ MiB/;s/G/ GiB/')
+fi
+
+echo "40" >&3
+echo "# Encrypting Data..." >&3
+
+# --- 8. CRYPTO ---
+KEY_HEX=$(openssl rand -hex 32)
+IV_PAYLOAD=$(openssl rand -hex 16)
+IV_FILENAME=$(openssl rand -hex 16)
+IV_HOSTNAME=$(openssl rand -hex 16)
+IV_SIZE=$(openssl rand -hex 16)
+
+openssl enc -aes-256-cbc -K "$KEY_HEX" -iv "$IV_PAYLOAD" -in "$TARGET_FILE" -out "$SANDBOX_DIR/payload.bin" -nosalt
+PAYLOAD_HASH=$(openssl dgst -sha256 "$SANDBOX_DIR/payload.bin" | awk '{print $2}')
+
+echo -n "$FILENAME" > "$SANDBOX_DIR/fn.txt"
+ENC_FILENAME=$(openssl enc -aes-256-cbc -K "$KEY_HEX" -iv "$IV_FILENAME" -in "$SANDBOX_DIR/fn.txt" -nosalt | xxd -p | tr -d '\n')
+echo -n "$HOST_NAME" > "$SANDBOX_DIR/host.txt"
+ENC_HOSTNAME=$(openssl enc -aes-256-cbc -K "$KEY_HEX" -iv "$IV_HOSTNAME" -in "$SANDBOX_DIR/host.txt" -nosalt | xxd -p | tr -d '\n')
+echo -n "$FILESIZE_HR" > "$SANDBOX_DIR/size.txt"
+ENC_SIZE=$(openssl enc -aes-256-cbc -K "$KEY_HEX" -iv "$IV_SIZE" -in "$SANDBOX_DIR/size.txt" -nosalt | xxd -p | tr -d '\n')
+
+echo "60" >&3
+echo "# Generating SSL..." >&3
+
+cat <<EOF > "$SANDBOX_DIR/openssl.cnf"
+[req]
+distinguished_name = req_distinguished_name
+x509_extensions = v3_req
+prompt = no
+[req_distinguished_name]
+CN = $IP_ADDR
+[v3_req]
+basicConstraints = CA:FALSE
+keyUsage = digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = @alt_names
+[alt_names]
+IP.1 = $IP_ADDR
+EOF
+
+openssl req -new -newkey rsa:2048 -days 1 -nodes -x509 \
+    -config "$SANDBOX_DIR/openssl.cnf" \
+    -keyout "$SANDBOX_DIR/key.pem" \
+    -out "$SANDBOX_DIR/cert.pem" >> "$LOG_FILE" 2>&1
+
+echo "80" >&3
+echo "# Starting Server..." >&3
+
+# --- 9. SERVER ---
+SERVER_SCRIPT="$SANDBOX_DIR/server.py"
+cat <<EOF > "$SERVER_SCRIPT"
+import http.server, ssl, sys
+sys.stdout.reconfigure(line_buffering=True); sys.stderr.reconfigure(line_buffering=True)
+try:
+    class SecureHandler(http.server.SimpleHTTPRequestHandler):
+        def end_headers(self):
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            super().end_headers()
+        def guess_type(self, path):
+            ctype = super().guess_type(path)
+            if path.endswith(".html"): return "text/html; charset=utf-8"
+            return ctype
+        def log_message(self, format, *args): print("Request: " + format%args)
+    httpd = http.server.ThreadingHTTPServer(('', $PORT), SecureHandler)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain('$SANDBOX_DIR/cert.pem', '$SANDBOX_DIR/key.pem')
+    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+    print("Listening...")
+    httpd.serve_forever()
+except Exception as e: print(f"ERROR: {e}"); sys.exit(1)
+EOF
+
+(cd "$SANDBOX_DIR" && python3 server.py "$MAGIC_TOKEN" >> "$LOG_FILE" 2>&1) &
+SERVER_PID=$!
+
+echo "90" >&3
+echo "# Verifying..." >&3
+
+sleep 1.5
+if ! kill -0 $SERVER_PID 2>/dev/null; then
+    KEEP_LOGS="true"
+    zenity --text-info --title="Crashed" --filename="$LOG_FILE"
+    exit 1
+fi
+HTTP_STATUS=$(curl -k -s -o /dev/null -w "%{http_code}" "https://127.0.0.1:$PORT/payload.bin")
+if [ "$HTTP_STATUS" != "200" ]; then
+    KEEP_LOGS="true"
+    zenity --text-info --title="Network Error" --filename="$LOG_FILE"
+    exit 1
+fi
+
+echo "100" >&3
+sleep 0.5
+
+# --- 10. GENERATE CLIENT ---
+URL="https://$IP_ADDR:$PORT/#$KEY_HEX|$IV_PAYLOAD|$IV_FILENAME|$IV_HOSTNAME|$IV_SIZE|$ENC_FILENAME|$ENC_HOSTNAME|$ENC_SIZE|$PAYLOAD_HASH"
+QR_IMG="$SANDBOX_DIR/qr.png"
+qrencode -o "$QR_IMG" -s 4 -m 2 "$URL"
+
+cat <<EOF > "$SANDBOX_DIR/index.html"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Secure Drop</title>
+<style>
+body{font-family:system-ui,-apple-system,sans-serif;background:#121212;color:#eee;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}
+.box{background:#1e1e1e;padding:2rem;border-radius:16px;text-align:center;width:85%;max-width:340px;box-shadow: 0 10px 30px rgba(0,0,0,0.5);}
+h2 {font-weight: 600; margin-bottom: 20px;}
+.host-info { font-size: 0.95rem; color: #bbb; margin-bottom: 20px; line-height: 1.4; }
+.fn{background:#2c2c2c;padding:12px;border-radius:8px;margin:0 0 20px 0;font-family:monospace;word-break:break-all;border:1px solid #333; color: #888; font-size: 0.85rem;}
+button{background:#4CAF50;color:#fff;border:none;padding:16px;width:100%;border-radius:12px;font-size:1.1rem;cursor:pointer;font-weight:600;transition: filter 0.2s;}
+button:active { filter: brightness(0.9); }
+button:disabled { background: #444; color: #888; cursor: not-allowed; }
+</style>
+</head>
+<body>
+<div class="box">
+<h2>🔒 E2EE Transfer</h2>
+<div id="host" class="host-info">Connecting...</div>
+<div id="fn" class="fn" style="display:none"></div>
+<button id="btn" onclick="go()" disabled>Verifying...</button>
+<div id="stat" style="margin-top:1rem;color:#ef5350;font-size:0.9rem"></div>
+</div>
+<script>
+let K, IV_P, IV_F, IV_H, IV_S, ENC_F, ENC_H, ENC_S, HASH, REAL_FN="unknown";
+const hex2buf = (hex) => new Uint8Array(hex.match(/.{2}/g).map(h=>parseInt(h,16)));
+const buf2hex = (buf) => Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,'0')).join('');
+window.onload=async()=>{
+  try{
+    if(!window.isSecureContext) throw new Error("Connection not secure");
+    let h=location.hash.substring(1).split('|');
+    if(h.length<9) throw new Error("Link Invalid");
+    [K, IV_P, IV_F, IV_H, IV_S, ENC_F, ENC_H, ENC_S, HASH] = h.map((v,i) => i<8 ? hex2buf(v) : v);
+    let kObj = await crypto.subtle.importKey("raw",K,{name:"AES-CBC"},false,["decrypt"]);
+    let hostBuf = await crypto.subtle.decrypt({name:"AES-CBC",iv:IV_H},kObj,ENC_H);
+    document.getElementById('host').innerText = "End to end Encrypted transfer inbound from " + new TextDecoder().decode(hostBuf) + ".";
+    let fnBuf = await crypto.subtle.decrypt({name:"AES-CBC",iv:IV_F},kObj,ENC_F);
+    let szBuf = await crypto.subtle.decrypt({name:"AES-CBC",iv:IV_S},kObj,ENC_S);
+    REAL_FN = new TextDecoder().decode(fnBuf);
+    let sizeStr = new TextDecoder().decode(szBuf);
+    let fnEl = document.getElementById('fn');
+    fnEl.innerText = REAL_FN + "\n(" + sizeStr + ")";
+    fnEl.style.display = "block";
+    fnEl.style.color = "#eee";
+    let btn = document.getElementById('btn');
+    btn.disabled = false;
+    btn.innerText = "Decrypt & Download";
+  }catch(e){ document.getElementById('stat').innerHTML = "<b>Scan Error:</b> Please scan the correct QR code again.<br><span style='font-size:0.8em;opacity:0.7;margin-top:5px;display:block'>(" + e.message + ")</span>"; }
+};
+async function go(){
+  let b=document.getElementById('btn');
+  try{
+    b.disabled=true; b.innerText="Downloading...";
+    let r=await fetch('payload.bin?t='+Date.now());
+    if(!r.ok) throw new Error("Network Error");
+    let d=await r.arrayBuffer();
+    b.innerText="Verifying Integrity...";
+    let hashBuf = await crypto.subtle.digest("SHA-256", d);
+    if(buf2hex(hashBuf) !== HASH) throw new Error("SECURITY ALERT: Integrity check failed!");
+    b.innerText="Decrypting File...";
+    let kObj = await crypto.subtle.importKey("raw",K,{name:"AES-CBC"},false,["decrypt"]);
+    let o=await crypto.subtle.decrypt({name:"AES-CBC",iv:IV_P},kObj,d);
+    let u=URL.createObjectURL(new Blob([o]));
+    let a=document.createElement('a'); a.href=u; a.download=REAL_FN; a.click();
+    b.innerText="Complete"; 
+  }catch(e){ b.innerText="Error"; b.style.background="#d32f2f"; document.getElementById('stat').innerHTML = "<b>Transfer Failed:</b> " + e.message; }
+}
+</script>
+</body>
+</html>
+EOF
+
+# --- 11. MAIN GUI ---
+GUI_SCRIPT="$SANDBOX_DIR/gui.py"
+cat <<EOF > "$GUI_SCRIPT"
+import sys, gi, signal
+gi.require_version('Gtk', '4.0')
+from gi.repository import Gtk, Gdk, GLib
+app = Gtk.Application(application_id='com.secure.beam.native')
+def on_activate(app):
+    win = Gtk.ApplicationWindow(application=app)
+    win.set_default_size(320, 550)
+    win.set_icon_name("network-wireless-encrypted")
+    header = Gtk.HeaderBar()
+    win.set_titlebar(header)
+    win.set_title("$APP_TITLE")
+    css = b"""
+    .container { padding: 20px; background-color: white; }
+    .encrypted-box { background-color: #e8f5e9; color: #2e7d32; padding: 12px; border-radius: 8px; font-size: 13px; margin-top: 10px; border: 1px solid #c8e6c9; }
+    .ssl-warn { background-color: #fff3cd; color: #856404; padding: 10px; border-radius: 8px; font-size: 12px; margin-top: 10px; }
+    .filesize { font-weight: bold; margin-top: 15px; font-size: 14px; color: #2E3436; }
+    .timer { font-size: 12px; color: #888; margin-top: 5px; }
+    """
+    provider = Gtk.CssProvider()
+    provider.load_from_data(css)
+    Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+    box.add_css_class("container")
+    win.set_child(box)
+    try:
+        picture = Gtk.Picture.new_for_filename("$QR_IMG")
+        picture.set_can_shrink(False)
+        picture.set_halign(Gtk.Align.CENTER)
+        box.append(picture)
+    except: box.append(Gtk.Label(label="[QR Code Error]"))
+    msg = Gtk.Label(label="🔒 <b>This Send is end-to-end Encrypted.</b>", use_markup=True, css_classes=["encrypted-box"], wrap=True)
+    box.append(msg)
+    ssl = Gtk.Label(label="⚠ <b>Connection Tip:</b> Your device may warn 'Not Private' because we connect directly, not via internet. This is normal. Click <b>Advanced</b> -> <b>Proceed</b>.", use_markup=True, css_classes=["ssl-warn"], justify=Gtk.Justification.CENTER, wrap=True)
+    box.append(ssl)
+    lbl_size = Gtk.Label(label="Size: $FILESIZE_HR", css_classes=["filesize"])
+    box.append(lbl_size)
+    lbl_timer = Gtk.Label(label="Auto-closing in $TIMEOUT_SECONDS s", css_classes=["timer"])
+    box.append(lbl_timer)
+    btn = Gtk.Button(label="Stop Sharing")
+    btn.set_margin_top(15)
+    btn.connect('clicked', lambda x: app.quit())
+    box.append(btn)
+    remaining = $TIMEOUT_SECONDS
+    def update_timer():
+        nonlocal remaining
+        remaining -= 1
+        lbl_timer.set_label(f"Auto-closing in {remaining} s")
+        if remaining <= 0: app.quit(); return False
+        return True
+    GLib.timeout_add(1000, update_timer)
+    win.present()
+app.connect('activate', on_activate)
+app.run(None)
+EOF
+
+# EXECUTE GUI IN BACKGROUND & WAIT
+python3 "$GUI_SCRIPT" "$MAGIC_TOKEN" &
+GUI_PID=$!
+wait $GUI_PID
+exit 0

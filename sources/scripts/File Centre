@@ -1,0 +1,731 @@
+#!/bin/bash
+
+# ==============================================================================
+# Title:        File Centre
+# Description:  Modern GNOME file dashboard and utility, to manage a file throughout its lifecycle.
+# ==============================================================================
+
+# --- 1. BOOTSTRAP LOGGING ---
+LOG_FILE="/tmp/file_centre_debug.log"
+exec 2> "$LOG_FILE"
+
+# --- 2. DEPENDENCY CHECK ---
+check_bin() { if ! command -v "$1" &> /dev/null; then echo "MISSING BIN: $1" >> "$LOG_FILE"; fi; }
+check_gi() { 
+    if ! python3 -c "import gi; gi.require_version('$1', '$2')" &> /dev/null; then
+        echo "MISSING LIB: gir1.2-$3" >> "$LOG_FILE"
+    fi
+}
+
+check_bin ffprobe
+check_gi Adw 1 adw-1
+check_gi Gtk 4.0 gtk-4.0
+check_gi GExiv2 0.10 gexiv2-0.10 
+
+if [ $# -eq 0 ]; then
+    echo "Usage: $0 <filename>"
+    exit 0
+fi
+
+# --- 3. THE TRAP ---
+GUI_SCRIPT=$(mktemp)
+cleanup() { rm -f "$GUI_SCRIPT"; }
+trap cleanup EXIT SIGINT SIGTERM
+
+# --- 4. THE PYTHON ENGINE ---
+cat <<'EOF' > "$GUI_SCRIPT"
+import sys, os, subprocess, threading, time, datetime, grp, pwd, re, mmap, warnings, hashlib, json
+import gi
+
+warnings.filterwarnings("ignore")
+
+# --- SMART LOGGER (FIXED) ---
+def log(arg1, arg2=None):
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    # Handle both log("Message") and log("CONTEXT", "Message")
+    if arg2:
+        entry = f"[{ts}] [{arg1}] {arg2}"
+    else:
+        entry = f"[{ts}] {arg1}"
+        
+    with open("/tmp/file_centre_debug.log", "a") as f:
+        f.write(entry + "\n")
+
+try:
+    gi.require_version('Gtk', '4.0')
+    gi.require_version('Adw', '1')
+    gi.require_version('GExiv2', '0.10')
+    from gi.repository import Gtk, Adw, GLib, Gio, Gdk, GExiv2
+except Exception as e:
+    log(f"CRITICAL: {e}")
+    sys.exit(1)
+
+HAS_MUTAGEN = False
+try:
+    import mutagen
+    from mutagen.easyid3 import EasyID3
+    HAS_MUTAGEN = True
+except ImportError: pass
+
+APP_ID = 'com.file.centre.production'
+TARGET = sys.argv[1]
+
+def run_cmd(cmd_list, timeout=2.0):
+    try:
+        return subprocess.check_output(cmd_list, stderr=subprocess.DEVNULL, text=True, timeout=timeout).strip()
+    except: return None
+
+class FileCentreApp(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.NON_UNIQUE)
+        self.filename = os.path.basename(TARGET)
+        self.target_path = TARGET
+        self.signal_ids = {}
+
+    def do_activate(self):
+        # CSS
+        css = Gtk.CssProvider()
+        css.load_from_data(b"""
+            .warning-card {
+                background-color: #fff8e1;
+                color: #5c3a00;
+                border: 1px solid #eebb00;
+                border-radius: 8px;
+                padding: 12px;
+            }
+            .warning-icon { color: #eebb00; }
+        """)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+        self.win = Adw.ApplicationWindow(application=self)
+        self.win.set_title(f"{self.filename}")
+        self.win.set_default_size(550, 750)
+
+        toolbar = Adw.ToolbarView()
+        self.win.set_content(toolbar)
+        toolbar.add_top_bar(Adw.HeaderBar())
+        
+        self.toast_overlay = Adw.ToastOverlay()
+        toolbar.set_content(self.toast_overlay)
+        
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.toast_overlay.set_child(main_box)
+
+        self.stack = Gtk.Stack()
+        self.stack.set_vexpand(True)
+        self.stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        
+        sw_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        sw_box.set_halign(Gtk.Align.CENTER)
+        sw_box.set_margin_top(12); sw_box.set_margin_bottom(12)
+        switcher = Gtk.StackSwitcher()
+        switcher.set_stack(self.stack)
+        sw_box.append(switcher)
+        main_box.append(sw_box)
+
+        self.load_overlay = Gtk.Overlay()
+        self.load_overlay.set_child(self.stack)
+        main_box.append(self.load_overlay)
+        
+        self.loading_bin = Gtk.CenterBox()
+        self.spinner = Gtk.Spinner()
+        self.spinner.set_size_request(64, 64); self.spinner.start()
+        self.loading_bin.set_center_widget(self.spinner)
+        self.load_overlay.add_overlay(self.loading_bin)
+
+        try:
+            self.build_status_tab()
+            self.build_history_tab()
+            self.build_metadata_tab()
+        except Exception as e: log(f"UI Build Error: {e}")
+        
+        self.win.present()
+        threading.Thread(target=self.bg_load_all_data, daemon=True).start()
+
+    # --- UI ---
+    def build_status_tab(self):
+        page = Adw.StatusPage(title="Status", icon_name="view-reveal-symbolic")
+        try:
+            f = Gio.File.new_for_path(self.target_path)
+            i = f.query_info("standard::icon", 0, None)
+            p = Gtk.IconTheme.get_for_display(Gdk.Display.get_default()).lookup_by_gicon(i.get_icon(), 128, 1, 0)
+            if p: page.set_paintable(p)
+        except: pass
+        
+        clamp = Adw.Clamp(maximum_size=500); page.set_child(clamp)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
+        box.set_margin_top(12); clamp.set_child(box)
+
+        grp = Adw.PreferencesGroup(title="Active Locks")
+        box.append(grp)
+        self.lock_list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        grp.add(self.lock_list_box)
+        
+        row = Adw.ActionRow(title="Scanning...", subtitle="Checking...")
+        self.lock_spin = Gtk.Spinner(); self.lock_spin.start()
+        row.add_suffix(self.lock_spin)
+        self.lock_list_box.append(row)
+
+        grp_sec = Adw.PreferencesGroup(title="Security and Ownership")
+        box.append(grp_sec)
+        self.row_stat_owner = Adw.ActionRow(title="Owner")
+        grp_sec.add(self.row_stat_owner)
+        self.row_selinux = Adw.ActionRow(title="SELinux Context")
+        grp_sec.add(self.row_selinux)
+
+        grp_p = Adw.PreferencesGroup(title="Permissions")
+        box.append(grp_p)
+        self.sw_ro = self.mk_sw(grp_p, "Read-Only", "Prevent changes", self.on_ro)
+        self.sw_ex = self.mk_sw(grp_p, "Executable", "Allow running", self.on_ex)
+        self.sw_hide = self.mk_sw(grp_p, "Hidden", "Rename with dot (.) prefix", self.on_hide)
+        self.stack.add_titled(page, "status", "Status")
+
+    def mk_sw(self, grp, t, s, cb):
+        row = Adw.ActionRow(title=t, subtitle=s)
+        sw = Gtk.Switch(valign=Gtk.Align.CENTER, sensitive=False)
+        # Store signal ID
+        handler = sw.connect("state-set", cb)
+        self.signal_ids[sw] = handler
+        row.add_suffix(sw)
+        grp.add(row)
+        return sw
+
+    def build_history_tab(self):
+        page = Adw.StatusPage(title="History", icon_name="document-open-recent-symbolic")
+        clamp = Adw.Clamp(maximum_size=500); page.set_child(clamp)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
+        box.set_margin_top(12); clamp.set_child(box)
+
+        grp_store = Adw.PreferencesGroup(title="Storage Forensics")
+        box.append(grp_store)
+        self.row_path = Adw.ActionRow(title="Location"); self.row_path.set_subtitle_lines(2)
+        grp_store.add(self.row_path)
+        self.row_fs = Adw.ActionRow(title="Filesystem")
+        grp_store.add(self.row_fs)
+        self.row_usage = Adw.ActionRow(title="Disk Usage", subtitle="Calculating...")
+        grp_store.add(self.row_usage)
+        self.row_links = Adw.ActionRow(title="Hard Link Count")
+        grp_store.add(self.row_links)
+
+        self.link_warning = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        self.link_warning.add_css_class("warning-card")
+        self.link_warning.set_margin_top(4); self.link_warning.set_visible(False)
+        icon = Gtk.Image.new_from_icon_name("dialog-warning-symbolic")
+        icon.add_css_class("warning-icon")
+        self.link_warning.append(icon)
+        self.link_warning.append(Gtk.Label(label="<b>Duplicate Reference</b>: This file may have duplicates saved elsewhere on the disk.", use_markup=True, wrap=True, xalign=0))
+        box.append(self.link_warning)
+
+        grp_hash = Adw.PreferencesGroup(title="Digital Fingerprints")
+        box.append(grp_hash)
+        self.row_md5 = Adw.ActionRow(title="MD5", subtitle="Calculating...")
+        btn_md5 = Gtk.Button(icon_name="edit-copy-symbolic", css_classes=["flat"], valign=Gtk.Align.CENTER)
+        btn_md5.connect("clicked", self.on_copy_hash, "MD5")
+        self.row_md5.add_suffix(btn_md5); grp_hash.add(self.row_md5)
+        self.row_sha = Adw.ActionRow(title="SHA-256", subtitle="Calculating...")
+        btn_sha = Gtk.Button(icon_name="edit-copy-symbolic", css_classes=["flat"], valign=Gtk.Align.CENTER)
+        btn_sha.connect("clicked", self.on_copy_hash, "SHA")
+        self.row_sha.add_suffix(btn_sha); grp_hash.add(self.row_sha)
+
+        grp_time = Adw.PreferencesGroup(title="Chronology")
+        box.append(grp_time)
+        self.row_birth = Adw.ActionRow(title="Created")
+        grp_time.add(self.row_birth)
+        row_mod = Adw.ActionRow(title="Modified")
+        self.entry_date = Gtk.Entry(placeholder_text="YYYY-MM-DD HH:MM", valign=Gtk.Align.CENTER)
+        btn_mod = Gtk.Button(icon_name="document-save-symbolic", css_classes=["flat"], valign=Gtk.Align.CENTER)
+        btn_mod.connect("clicked", self.on_date)
+        row_mod.add_suffix(self.entry_date); row_mod.add_suffix(btn_mod)
+        grp_time.add(row_mod)
+        self.row_access = Adw.ActionRow(title="Accessed")
+        grp_time.add(self.row_access)
+        self.row_change = Adw.ActionRow(title="Changed")
+        grp_time.add(self.row_change)
+
+        grp_src = Adw.PreferencesGroup(title="Origin")
+        box.append(grp_src)
+        self.entry_url = Adw.EntryRow(title="Source URL", show_apply_button=True)
+        self.entry_url.connect("apply", self.on_url)
+        self.btn_link = Gtk.Button(icon_name="external-link-symbolic", css_classes=["flat"], valign=Gtk.Align.CENTER, sensitive=False)
+        self.btn_link.connect("clicked", lambda x: subprocess.Popen(['xdg-open', self.entry_url.get_text()]))
+        self.entry_url.add_suffix(self.btn_link); grp_src.add(self.entry_url)
+        self.stack.add_titled(page, "history", "History")
+
+    def build_metadata_tab(self):
+        page = Adw.StatusPage(title="Metadata", icon_name="drive-harddisk-ieee1394-symbolic")
+        clamp = Adw.Clamp(maximum_size=500); page.set_child(clamp)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
+        box.set_margin_top(12); clamp.set_child(box)
+
+        self.grp_id = Adw.PreferencesGroup(title="Identity")
+        box.append(self.grp_id)
+        self.row_mime = Adw.ActionRow(title="Kind")
+        self.grp_id.add(self.row_mime)
+        self.row_owner = Adw.ActionRow(title="Owner")
+        self.grp_id.add(self.row_owner)
+        self.row_magic = Adw.ActionRow(title="Description")
+        self.grp_id.add(self.row_magic)
+
+        self.grp_tech = Adw.PreferencesGroup(title="Technical Data")
+        box.append(self.grp_tech)
+        self.tech_rows = {}
+        for t in ["Dimensions", "ISO", "Aperture", "Shutter Speed", "Focal Length", "GPS Location", "Model"]:
+            row = Adw.ActionRow(title=t); self.grp_tech.add(row); self.tech_rows[t] = row
+        self.btn_wipe_gps = Gtk.Button(label="Remove Location", css_classes=["destructive-action"], valign=Gtk.Align.CENTER, visible=False)
+        self.btn_wipe_gps.connect("clicked", self.on_wipe_gps)
+        self.tech_rows["GPS Location"].add_suffix(self.btn_wipe_gps)
+
+        self.grp_tags = Adw.PreferencesGroup(title="Image Tags")
+        box.append(self.grp_tags)
+        self.tag_entries = {}
+        for k in ["Make", "Software", "Artist", "Copyright", "Title"]:
+            row = Adw.EntryRow(title=k, show_apply_button=True)
+            row.connect("apply", self.on_save_exif_entry, k)
+            self.grp_tags.add(row); self.tag_entries[k] = row
+
+        self.grp_aud = Adw.PreferencesGroup(title="Audio Attributes")
+        box.append(self.grp_aud)
+        self.aud_read_rows = {}
+        for t in ["Duration", "Bitrate", "Sample Rate"]:
+            row = Adw.ActionRow(title=t); self.grp_aud.add(row); self.aud_read_rows[t] = row
+        self.id3_entries = {}
+        for key in ["title", "artist", "album", "albumartist", "composer", "genre", "date", "copyright"]:
+            row = Adw.EntryRow(title=key, show_apply_button=True)
+            row.connect("apply", self.on_save_id3_entry, key)
+            self.grp_aud.add(row); self.id3_entries[key] = row
+
+        self.grp_doc = Adw.PreferencesGroup(title="Document Attributes")
+        box.append(self.grp_doc)
+        self.doc_read_rows = {}
+        for t in ["PDF Version", "Pages", "Page Size", "Producer", "Creator"]:
+            row = Adw.ActionRow(title=t); self.grp_doc.add(row); self.doc_read_rows[t] = row
+
+        self.grp_note = Adw.PreferencesGroup(title="Notes")
+        box.append(self.grp_note)
+        f = Gtk.Frame(css_classes=["card"])
+        scrol = Gtk.ScrolledWindow(height_request=100)
+        self.txt_notes = Gtk.TextView(wrap_mode=3, top_margin=10, bottom_margin=10, left_margin=10, right_margin=10)
+        ctrl = Gtk.EventControllerFocus()
+        ctrl.connect("leave", self.on_note)
+        self.txt_notes.add_controller(ctrl)
+        scrol.set_child(self.txt_notes); f.set_child(scrol)
+        box.append(f)
+        
+        self.stack.add_titled(page, "meta", "Metadata")
+
+    # ================= LOGIC & FORENSICS =================
+
+    def bg_load_all_data(self):
+        log("THREAD", "Starting analysis...")
+        data = {
+            'locks': [], 'mtime': 0, 'atime': 0, 'ctime': 0, 'btime': 0,
+            'writable': False, 'executable': False,
+            'owner': 'Unknown', 'hidden': False, 'note': '', 'url': '', 'mime': 'Unknown',
+            'type': {'img': False, 'aud': False, 'pdf': False},
+            'tech': {}, 'exif': {}, 'id3': {}, 'pdf': {}, 'has_gps': False, 
+            'md5': 'Calculating...', 'sha': 'Calculating...',
+            'fs_type': 'Unknown', 'abs_path': os.path.abspath(self.target_path),
+            'selinux': 'Unknown', 'blocks': 0, 'size': 0, 'links': 1, 'magic': ''
+        }
+
+        # 1. FFPROBE
+        try:
+            cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', self.target_path]
+            out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+            ff = json.loads(out)
+            
+            fmt = ff.get('format', {})
+            if 'duration' in fmt: 
+                data['tech']['Duration'] = str(datetime.timedelta(seconds=int(float(fmt['duration']))))
+            if 'bit_rate' in fmt:
+                data['tech']['Bitrate'] = f"{int(fmt['bit_rate']) // 1000} kbps"
+            
+            for s in ff.get('streams', []):
+                if s.get('codec_type') == 'audio':
+                    if 'sample_rate' in s: data['tech']['Sample Rate'] = f"{s['sample_rate']} Hz"
+                    break
+        except Exception as e: log("FFPROBE", f"Failed: {e}")
+
+        # 2. FILE STATS & LOCKS
+        try:
+            out = run_cmd(['fuser', '-u', self.target_path], timeout=1.0)
+            if out:
+                parts = out.split()
+                for p_str in parts:
+                    pid = ''.join(filter(str.isdigit, p_str))
+                    if pid:
+                        name = run_cmd(['ps', '-p', pid, '-o', 'comm=']) or "Unknown"
+                        user = run_cmd(['ps', '-p', pid, '-o', 'user=']) or "Unknown"
+                        data['locks'].append({'pid': pid, 'name': name, 'user': user})
+        except: pass
+
+        try:
+            s = os.stat(self.target_path)
+            data['mtime'], data['atime'], data['ctime'] = s.st_mtime, s.st_atime, s.st_ctime
+            try: data['btime'] = s.st_birthtime
+            except: data['btime'] = 0
+            data['size'] = s.st_size; data['blocks'] = s.st_blocks * 512; data['links'] = s.st_nlink
+            data['writable'] = os.access(self.target_path, os.W_OK)
+            data['executable'] = os.access(self.target_path, os.X_OK)
+            try: data['owner'] = f"{pwd.getpwuid(s.st_uid).pw_name} : {grp.getgrgid(s.st_gid).gr_name}"
+            except: pass
+        except: pass
+        
+        try: out = run_cmd(['df', '-T', '-P', self.target_path]); data['fs_type'] = out.splitlines()[1].split()[1]
+        except: pass
+        try: out = run_cmd(['ls', '-Z', self.target_path]); data['selinux'] = out.split()[0]
+        except: pass
+        try: data['magic'] = run_cmd(['file', '-b', self.target_path])[:60]
+        except: pass
+        try: data['note'] = os.getxattr(self.target_path, "user.comment").decode('utf-8')
+        except: pass
+        try: data['url'] = os.getxattr(self.target_path, "user.xdg.origin.url").decode('utf-8')
+        except: pass
+
+        if os.path.getsize(self.target_path) < 500 * 1024 * 1024:
+            try:
+                md5 = hashlib.md5(); sha = hashlib.sha256()
+                with open(self.target_path, 'rb') as f:
+                    while chunk := f.read(65536): md5.update(chunk); sha.update(chunk)
+                data['md5'] = md5.hexdigest(); data['sha'] = sha.hexdigest()
+            except: data['md5'] = "Error"
+        else: data['md5'] = "File too large"
+
+        try:
+            f = Gio.File.new_for_path(self.target_path)
+            info = f.query_info("standard::content-type", 0, None)
+            data['mime'] = info.get_content_type()
+        except: pass
+
+        is_img = "image" in data['mime'] or self.target_path.lower().endswith(('.jpg','.jpeg','.png','.heic','.heif','.webp'))
+        is_aud = "audio" in data['mime'] or self.target_path.lower().endswith(('.mp3', '.ogg', '.flac', '.m4a'))
+        is_pdf = "pdf" in data['mime'] or self.target_path.lower().endswith('.pdf')
+        data['type'] = {'img': is_img, 'aud': is_aud, 'pdf': is_pdf}
+
+        if is_img:
+            try:
+                t = Gdk.Texture.new_from_filename(self.target_path)
+                data['tech']['Dimensions'] = f"{t.get_width()} x {t.get_height()} px"
+            except: pass
+
+            loaded_std = False
+            try:
+                exiv = GExiv2.Metadata()
+                exiv.open_path(self.target_path)
+                try: data['tech']['ISO'] = str(exiv.get_iso_speed())
+                except: pass
+                try: data['tech']['Aperture'] = f"f/{exiv.get_fnumber():.1f}"
+                except: pass
+                try: 
+                    n,d = exiv.get_exposure_time()
+                    data['tech']['Shutter Speed'] = f"1/{d}" if n==1 else f"{n/d:.4f}s"
+                except: pass
+                try: data['tech']['Focal Length'] = f"{exiv.get_focal_length():.1f} mm"
+                except: pass
+                try:
+                    valid, lat, lon, alt = exiv.get_gps_info()
+                    if valid: 
+                        data['tech']['GPS Location'] = f"{lat:.5f}, {lon:.5f}"
+                        data['has_gps'] = True
+                except: pass
+
+                def fish(keys):
+                    for k in keys:
+                        try:
+                            v = exiv.get_tag_string(k).strip()
+                            if v and not v.startswith("type="): return v
+                        except: continue
+                    return ""
+                
+                data['exif']['Make'] = fish(['Exif.Image.Make'])
+                data['exif']['Model'] = fish(['Exif.Image.Model'])
+                data['exif']['Software'] = fish(['Exif.Image.Software', 'Xmp.xmp.CreatorTool'])
+                data['exif']['Artist'] = fish(['Exif.Image.Artist', 'Xmp.dc.creator'])
+                data['exif']['Copyright'] = fish(['Exif.Image.Copyright', 'Xmp.dc.rights'])
+                data['exif']['Title'] = fish(['Exif.Image.ImageDescription', 'Xmp.dc.title'])
+                if 'Model' in data['exif']: data['tech']['Model'] = data['exif']['Model']
+                loaded_std = True
+            except: pass
+
+            if not loaded_std or 'Model' not in data['exif']:
+                try:
+                    with open(self.target_path, 'rb') as f:
+                        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+                        def find_re(p):
+                            m = re.search(p.encode(), mm, re.IGNORECASE)
+                            return m.group(1).decode(errors='ignore') if m else None
+                        if 'Model' not in data['exif']:
+                            model = find_re(r'Model[>="]+([^"<>/]+)')
+                            if not model and mm.find(b'samsung') != -1: model = "Samsung Device"
+                            if model: data['tech']['Model'] = model
+                        if 'ISO' not in data['tech']: data['tech']['ISO'] = find_re(r'(?:ISO)[>="]+(\d+)')
+                        mm.close()
+                except: pass
+
+        if is_aud and HAS_MUTAGEN:
+            try:
+                if self.target_path.lower().endswith('.mp3'):
+                    try: tags = EasyID3(self.target_path)
+                    except: tags = {}
+                else: 
+                    f = mutagen.File(self.target_path)
+                    tags = f.tags or {}
+                
+                for k in ["title", "artist", "album", "albumartist", "composer", "genre", "date", "copyright"]:
+                     val = tags.get(k) or tags.get(k.upper())
+                     if val:
+                         if isinstance(val, list): val = ", ".join(val)
+                         data['id3'][k] = str(val)
+                log("AUDIO", "Tags loaded via Mutagen")
+            except Exception as e: log("AUDIO", f"Mutagen Error: {e}")
+
+        if is_pdf:
+            try:
+                out = run_cmd(['pdfinfo', self.target_path])
+                for line in out.splitlines():
+                    if ":" in line:
+                        k, v = line.split(":", 1)
+                        data['pdf'][k.strip()] = v.strip()
+            except: pass
+
+        GLib.idle_add(self.render_data, data)
+
+    def render_data(self, data):
+        try:
+            self.loading_bin.set_visible(False)
+            self.load_overlay.remove_overlay(self.loading_bin)
+            
+            while child := self.lock_list_box.get_first_child():
+                self.lock_list_box.remove(child)
+            locks = data.get('locks', [])
+            if locks:
+                for l in locks:
+                    row = Adw.ActionRow(title=f"{l['name']}", subtitle=f"PID: {l['pid']} • User: {l['user']}")
+                    row.set_icon_name("dialog-warning-symbolic")
+                    btn = Gtk.Button(label="End Task", css_classes=["destructive-action"], valign=Gtk.Align.CENTER)
+                    btn.connect("clicked", self.on_kill_pid, l['pid'])
+                    row.add_suffix(btn)
+                    self.lock_list_box.append(row)
+            else:
+                row = Adw.ActionRow(title="File is free", subtitle="No active processes are reading/writing to this file right now.")
+                row.set_icon_name("security-high-symbolic")
+                self.lock_list_box.append(row)
+
+            # FIX: Toggles Enabled
+            self.sw_ro.set_active(not data.get('writable', True))
+            self.sw_ex.set_active(data.get('executable', False))
+            self.sw_ro.set_sensitive(True)
+            self.sw_ex.set_sensitive(True)
+            
+            is_dot = os.path.basename(self.target_path).startswith(".")
+            self.sw_hide.set_state(is_dot); self.sw_hide.set_active(is_dot); self.sw_hide.set_sensitive(True)
+
+            self.row_stat_owner.set_subtitle(data.get('owner', 'Unknown'))
+            self.row_selinux.set_subtitle(data.get('selinux', 'Not Available'))
+
+            def fmt_time(ts): return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S") if ts else "Unknown"
+            if 'mtime' in data: self.entry_date.set_text(fmt_time(data['mtime']))
+            if 'atime' in data: self.row_access.set_subtitle(fmt_time(data['atime']))
+            if 'ctime' in data: self.row_change.set_subtitle(fmt_time(data['ctime']))
+            if 'btime' in data and data['btime']: self.row_birth.set_subtitle(fmt_time(data['btime']))
+
+            self.row_md5.set_subtitle(data.get('md5', 'Error'))
+            self.row_sha.set_subtitle(data.get('sha', 'Error'))
+            self.row_path.set_subtitle(data.get('abs_path', self.target_path))
+            self.row_fs.set_subtitle(data.get('fs_type', 'Unknown'))
+            
+            def fmt_size(b):
+                if b < 1024: return f"{b} B"
+                elif b < 1024**2: return f"{b/1024:.2f} KiB"
+                elif b < 1024**3: return f"{b/1024**2:.2f} MiB"
+                return f"{b/1024**3:.2f} GiB"
+
+            phy = data.get('blocks', 0); logi = data.get('size', 0)
+            self.row_usage.set_subtitle(f"Physical: {fmt_size(phy)} | Logical: {fmt_size(logi)}")
+            
+            links = data.get('links', 1)
+            self.row_links.set_subtitle(f"{links} path(s) point to this data")
+            self.link_warning.set_visible(links > 1)
+
+            self.row_owner.set_subtitle(data.get('owner', 'Unknown'))
+            self.row_mime.set_subtitle(data.get('mime', 'Unknown'))
+            self.row_magic.set_subtitle(data.get('magic', 'Unknown'))
+            self.txt_notes.get_buffer().set_text(data.get('note', ''))
+            
+            if data.get('url'): 
+                self.entry_url.set_text(data['url'])
+                self.btn_link.set_sensitive(True)
+            else:
+                self.entry_url.set_text("")
+                self.btn_link.set_sensitive(False)
+
+            t = data.get('type', {})
+            self.grp_tech.set_visible(t.get('img', False))
+            self.grp_tags.set_visible(t.get('img', False))
+            self.grp_aud.set_visible(t.get('aud', False))
+            self.grp_doc.set_visible(t.get('pdf', False))
+
+            tech = data.get('tech', {})
+            for k, row in self.tech_rows.items():
+                if k in tech: row.set_subtitle(tech[k])
+            
+            if 'Bitrate' in tech: self.aud_read_rows['Bitrate'].set_subtitle(tech['Bitrate'])
+            if 'Duration' in tech: self.aud_read_rows['Duration'].set_subtitle(tech['Duration'])
+            if 'Sample Rate' in tech: self.aud_read_rows['Sample Rate'].set_subtitle(tech['Sample Rate'])
+            
+            if data.get('has_gps'): self.btn_wipe_gps.set_visible(True)
+            else: self.btn_wipe_gps.set_visible(False)
+
+            for k, v in data.get('exif', {}).items():
+                if k in self.tag_entries: self.tag_entries[k].set_text(v)
+            for k, v in data.get('id3', {}).items():
+                if k in self.id3_entries: self.id3_entries[k].set_text(v)
+            
+            pdf = data.get('pdf', {})
+            for k, row in self.doc_read_rows.items():
+                if k in pdf: row.set_subtitle(pdf[k])
+        except Exception as e: log("UI", f"Render Error: {e}")
+
+    # --- Actions ---
+    def on_hide(self, sw, state):
+        if sw in self.signal_ids: sw.handler_block(self.signal_ids[sw])
+        
+        dirname = os.path.dirname(self.target_path)
+        basename = os.path.basename(self.target_path)
+        new_path = None
+        
+        try:
+            if state:
+                if not basename.startswith("."):
+                    new_name = "." + basename
+                    new_path = os.path.join(dirname, new_name)
+                    os.rename(self.target_path, new_path)
+                    self.show_toast("File Hidden (Renamed)")
+            else:
+                if basename.startswith("."):
+                    new_name = basename[1:]
+                    new_path = os.path.join(dirname, new_name)
+                    os.rename(self.target_path, new_path)
+                    self.show_toast("File Visible (Renamed)")
+
+            if new_path:
+                self.target_path = new_path
+                self.filename = os.path.basename(new_path)
+                self.win.set_title(self.filename)
+                
+        except Exception as e:
+            self.show_toast("Rename Failed: Permission Denied")
+            sw.set_active(not state) 
+        
+        if sw in self.signal_ids: sw.handler_unblock(self.signal_ids[sw])
+
+    def on_copy_hash(self, btn, algo):
+        try:
+            val = self.row_md5.get_subtitle() if algo == "MD5" else self.row_sha.get_subtitle()
+            cb = Gdk.Display.get_default().get_clipboard()
+            cb.set(val)
+            self.show_toast(f"{algo} Copied")
+        except: pass
+
+    def on_wipe_gps(self, btn):
+        try:
+            exiv = GExiv2.Metadata()
+            exiv.open_path(self.target_path)
+            exiv.delete_gps_info()
+            for k in ["Xmp.exif.GPSLatitude", "Xmp.exif.GPSLongitude"]:
+                try: exiv.clear_tag(k)
+                except: pass
+            exiv.save_file(self.target_path) 
+            self.show_toast("Location Erased")
+            threading.Thread(target=self.bg_load_all_data, daemon=True).start()
+        except: self.show_toast("Error Erasing GPS")
+
+    def on_save_exif_entry(self, entry, key):
+        try:
+            exiv = GExiv2.Metadata()
+            exiv.open_path(self.target_path)
+            val = entry.get_text()
+            tag_map = {
+                "Make": ["Exif.Image.Make"],
+                "Model": ["Exif.Image.Model"],
+                "Software": ["Exif.Image.Software", "Xmp.xmp.CreatorTool"],
+                "Artist": ["Exif.Image.Artist", "Xmp.dc.creator"],
+                "Copyright": ["Exif.Image.Copyright", "Xmp.dc.rights"],
+                "Title": ["Exif.Image.ImageDescription", "Xmp.dc.title"]
+            }
+            if key in tag_map:
+                for t in tag_map[key]:
+                    try: exiv.set_tag_string(t, val)
+                    except: pass
+                exiv.save_file(self.target_path)
+                self.show_toast(f"Saved {key}")
+        except: self.show_toast("Write Failed")
+
+    def on_save_id3_entry(self, entry, key):
+        try:
+            val = entry.get_text()
+            if self.filename.lower().endswith('.mp3'):
+                try: tags = EasyID3(self.target_path)
+                except: 
+                    f = mutagen.File(self.target_path, easy=True); f.add_tags(); f.save()
+                    tags = EasyID3(self.target_path)
+                tags[key] = val
+                tags.save()
+            else:
+                f = mutagen.File(self.target_path)
+                f[key] = val
+                f.save()
+            self.show_toast(f"Saved {key}")
+        except: self.show_toast("Write Failed")
+
+    def on_note(self, ctrl):
+        buf = self.txt_notes.get_buffer()
+        txt = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True).strip()
+        try: os.setxattr(self.target_path, "user.comment", txt.encode('utf-8'))
+        except: pass
+
+    def on_url(self, entry):
+        try: os.setxattr(self.target_path, "user.xdg.origin.url", entry.get_text().encode('utf-8'))
+        except: pass
+
+    def on_date(self, btn):
+        try:
+            dt = datetime.datetime.strptime(self.entry_date.get_text(), "%Y-%m-%d %H:%M")
+            os.utime(self.target_path, (dt.timestamp(), dt.timestamp()))
+            self.show_toast("Date Updated")
+        except: self.show_toast("Invalid Format")
+
+    def on_kill(self, btn): pass
+    
+    def on_kill_pid(self, btn, pid):
+        try:
+            subprocess.run(['kill', '-15', pid])
+            time.sleep(0.5)
+            if run_cmd(['ps', '-p', pid]): subprocess.run(['kill', '-9', pid])
+            self.show_toast(f"Process {pid} Terminated")
+            threading.Thread(target=self.bg_load_all_data, daemon=True).start()
+        except: self.show_toast("Failed to kill process")
+
+    def on_ro(self, sw, s): self.run_chmod(sw, s, "u-w" if s else "u+w", "File cannot be Written to", "File may be Written to")
+    def on_ex(self, sw, s): self.run_chmod(sw, s, "+x" if s else "-x", "Run-as-Program Allowed", "Run-as-Program Disallowed")
+    
+    def run_chmod(self, sw, state, arg, msg_true, msg_false):
+        try:
+            subprocess.run(['chmod', arg, self.target_path], check=True, stderr=subprocess.PIPE)
+            self.show_toast(msg_true if state else msg_false)
+        except:
+            sw.set_active(not state)
+            self.show_toast("Permission Error")
+
+    def show_toast(self, msg):
+        self.toast_overlay.add_toast(Adw.Toast.new(msg))
+
+if __name__ == "__main__":
+    app = FileCentreApp()
+    app.run(None)
+EOF
+
+python3 "$GUI_SCRIPT" "$@"
+exit 0

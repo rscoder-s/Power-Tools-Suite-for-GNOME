@@ -1,0 +1,481 @@
+#!/bin/bash
+
+# ==============================================================================
+# Title:        VirusTotal Scanner (Online Scan)
+# Description:  Modern GNOME App to scan a file for malware using a valid VirusTotal API key.
+# ==============================================================================
+
+# --- 1. LOGGING ---
+exec 2> /tmp/vt_scan.log
+
+# --- 2. DEPENDENCY CHECK ---
+check_dep() {
+    if ! command -v "$1" &> /dev/null; then
+        zenity --error --text="Missing Tool: <b>$1</b>" --width=300
+        exit 1
+    fi
+}
+check_dep python3
+check_dep curl
+check_dep xdg-open
+
+# --- 3. INPUT VALIDATION ---
+if [ $# -eq 0 ]; then
+    zenity --info --text="<b>VirusTotal Scanner</b>\n\nRight-click a file -> Scripts -> Scan with VirusTotal." --width=350
+    exit 0
+fi
+
+if [ $# -gt 1 ]; then
+    zenity --info --text="<b>Batch Scanning Not Supported</b>\n\nPlease select one file at a time to preserve API quota." --width=350
+    exit 0
+fi
+
+FILE_PATH="$1"
+
+if [ -d "$FILE_PATH" ]; then
+    zenity --error --text="<b>Cannot Scan Folders</b>\n\nPlease select a specific file." --width=350
+    exit 1
+fi
+
+# --- 4. GUI ENGINE ---
+GUI_SCRIPT=$(mktemp)
+cat <<'EOF' > "$GUI_SCRIPT"
+import sys
+import os
+import hashlib
+import json
+import time
+import datetime
+import urllib.request
+import urllib.error
+import ssl
+import threading
+import subprocess
+import gi
+
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+gi.require_version('Secret', '1')
+from gi.repository import Gtk, Adw, GLib, Gio, Secret, Gdk
+
+APP_ID = 'com.virustotal.scanner.gold'
+FILE_PATH = sys.argv[1]
+
+# Secret Schema
+SCHEMA = Secret.Schema.new("org.freedesktop.Secret.Generic", Secret.SchemaFlags.NONE, {"attribute": Secret.SchemaAttributeType.STRING})
+ATTRS = {"attribute": "virustotal_api_key"}
+
+class VirusTotalApp(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID)
+        self.api_key = None
+        self.file_hash = None
+        self.analysis_id = None
+        self.abort_flag = False
+        self.retry_target = None
+
+    def do_activate(self):
+        self.win = Adw.ApplicationWindow(application=self)
+        self.win.set_title("VirusTotal")
+        self.win.set_default_size(450, 650)
+        
+        self.stack = Adw.ViewStack()
+        header = Adw.HeaderBar()
+        header.set_show_end_title_buttons(False) # We control exit
+        
+        toolbar_view = Adw.ToolbarView()
+        toolbar_view.add_top_bar(header)
+        toolbar_view.set_content(self.stack)
+        self.win.set_content(toolbar_view)
+
+        # ===========================
+        # VIEW 1: API SETUP
+        # ===========================
+        page_setup = Adw.StatusPage()
+        page_setup.set_icon_name("dialog-password-symbolic")
+        page_setup.set_title("API Key Required")
+        page_setup.set_description("Enter your VirusTotal API Key to continue.")
+        
+        clamp_setup = Adw.Clamp(maximum_size=360)
+        box_setup = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
+        clamp_setup.set_child(box_setup)
+        page_setup.set_child(clamp_setup)
+        
+        grp_key = Adw.PreferencesGroup()
+        self.entry_key = Adw.EntryRow(title="API Key")
+        grp_key.add(self.entry_key)
+        box_setup.append(grp_key)
+        
+        btn_save = Gtk.Button(label="Save & Scan")
+        btn_save.add_css_class("suggested-action")
+        btn_save.add_css_class("pill")
+        btn_save.connect("clicked", self.on_save_key)
+        box_setup.append(btn_save)
+        
+        btn_get = Gtk.LinkButton(uri="https://www.virustotal.com/gui/join-us", label="Get a free API Key")
+        box_setup.append(btn_get)
+        
+        btn_cancel_setup = Gtk.Button(label="Cancel")
+        btn_cancel_setup.add_css_class("flat")
+        btn_cancel_setup.connect("clicked", lambda x: self.quit())
+        box_setup.append(btn_cancel_setup)
+        
+        self.stack.add_named(page_setup, "setup")
+
+        # ===========================
+        # VIEW 2: PROGRESS (Bar + Spinner)
+        # ===========================
+        self.page_progress = Adw.StatusPage()
+        self.page_progress.set_icon_name("system-search-symbolic")
+        self.page_progress.set_title("Scanning...")
+        
+        box_prog = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20)
+        box_prog.set_halign(Gtk.Align.CENTER)
+        
+        # 1. Spinner
+        self.spinner = Gtk.Spinner()
+        self.spinner.set_size_request(48, 48)
+        box_prog.append(self.spinner)
+        
+       # 2. Text Status
+        self.lbl_status = Gtk.Label(label="Initializing...")
+        self.lbl_status.add_css_class("body") # Regular weight font
+        self.lbl_status.set_justify(Gtk.Justification.CENTER)
+        box_prog.append(self.lbl_status)
+        
+        # 3. Progress Bar
+        self.pbar = Gtk.ProgressBar()
+        self.pbar.set_size_request(250, -1) # Width
+        box_prog.append(self.pbar)
+        
+        # 4. Cancel
+        btn_abort = Gtk.Button(label="Cancel Operation")
+        btn_abort.add_css_class("destructive-action")
+        btn_abort.add_css_class("pill")
+        btn_abort.connect("clicked", self.on_abort)
+        box_prog.append(btn_abort)
+        
+        self.page_progress.set_child(box_prog)
+        self.stack.add_named(self.page_progress, "progress")
+
+        # ===========================
+        # VIEW 3: RESULT (Rich Data)
+        # ===========================
+        self.page_result = Adw.StatusPage()
+        self.page_result.set_title("Analysis Complete")
+        
+        box_res = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        clamp_res = Adw.Clamp(maximum_size=360)
+        clamp_res.set_child(box_res)
+        self.page_result.set_child(clamp_res)
+        
+        # Stats Group
+        grp_res = Adw.PreferencesGroup()
+        self.row_date = Adw.ActionRow(title="Last Scanned")
+        self.row_malicious = Adw.ActionRow(title="Malicious Detections")
+        self.row_total = Adw.ActionRow(title="Engines Checked")
+        
+        grp_res.add(self.row_date)
+        grp_res.add(self.row_malicious)
+        grp_res.add(self.row_total)
+        box_res.append(grp_res)
+        
+        # Buttons
+        self.btn_view = Gtk.Button(label="View Full Report")
+        self.btn_view.add_css_class("pill")
+        self.btn_view.connect("clicked", self.on_view_report)
+        box_res.append(self.btn_view)
+        
+        self.btn_rescan = Gtk.Button(label="Force Re-scan")
+        self.btn_rescan.add_css_class("flat")
+        self.btn_rescan.connect("clicked", self.on_rescan)
+        box_res.append(self.btn_rescan)
+        
+        btn_close = Gtk.Button(label="Close")
+        btn_close.add_css_class("flat")
+        btn_close.connect("clicked", lambda x: self.quit())
+        box_res.append(btn_close)
+        
+        self.stack.add_named(self.page_result, "result")
+
+        # ===========================
+        # VIEW 4: ERROR
+        # ===========================
+        self.page_error = Adw.StatusPage()
+        self.page_error.set_icon_name("dialog-error-symbolic")
+        self.page_error.set_title("Error")
+        
+        box_err = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
+        box_err.set_halign(Gtk.Align.CENTER)
+        
+        self.lbl_error = Gtk.Label(label="Unknown Error")
+        self.lbl_error.set_wrap(True)
+        self.lbl_error.set_max_width_chars(40)
+        self.lbl_error.set_justify(Gtk.Justification.CENTER)
+        self.lbl_error.set_use_markup(True) # <--- ALLOWS BOLD TEXT
+        box_err.append(self.lbl_error)
+        
+        self.btn_retry = Gtk.Button(label="Retry")
+        self.btn_retry.add_css_class("suggested-action")
+        self.btn_retry.add_css_class("pill")
+        self.btn_retry.connect("clicked", self.on_retry_clicked)
+        box_err.append(self.btn_retry)
+        
+        btn_quit = Gtk.Button(label="Cancel")
+        btn_quit.connect("clicked", lambda x: self.quit())
+        box_err.append(btn_quit)
+        
+        self.page_error.set_child(box_err)
+        self.stack.add_named(self.page_error, "error")
+
+        self.win.present()
+
+        # STARTUP
+        self.check_key()
+
+    # --- LOGIC ---
+
+    def check_key(self):
+        try:
+            key = Secret.password_lookup_sync(SCHEMA, ATTRS, None)
+            if key:
+                self.api_key = key
+                self.start_scan_flow()
+            else:
+                self.stack.set_visible_child_name("setup")
+        except:
+            self.stack.set_visible_child_name("setup")
+
+    def on_save_key(self, btn):
+        key = self.entry_key.get_text().strip()
+        if len(key) == 64:
+            Secret.password_store_sync(SCHEMA, ATTRS, Secret.COLLECTION_DEFAULT, 'VirusTotal API Key', key, None)
+            self.api_key = key
+            self.start_scan_flow()
+        else:
+            self.show_error("Invalid Key", "API Key must be 64 characters long.", retry_target="setup")
+
+    def start_scan_flow(self):
+        self.abort_flag = False
+        self.stack.set_visible_child_name("progress")
+        self.spinner.start()
+        threading.Thread(target=self.run_scan_thread).start()
+
+    def update_status(self, text, fraction):
+        GLib.idle_add(self.lbl_status.set_label, text)
+        GLib.idle_add(self.pbar.set_fraction, fraction)
+
+    def on_abort(self, btn):
+        self.abort_flag = True
+        self.quit()
+
+    def run_scan_thread(self):
+        try:
+            # 1. Hashing
+            if self.abort_flag: return
+            self.update_status("Calculating Hash...", 0.1)
+            time.sleep(0.5) 
+            
+            sha256 = hashlib.sha256()
+            with open(FILE_PATH, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    if self.abort_flag: return
+                    sha256.update(chunk)
+            self.file_hash = sha256.hexdigest()
+
+            # 2. Check Exists
+            if self.abort_flag: return
+            self.update_status("Checking Database...", 0.4)
+            time.sleep(0.5)
+            
+            cmd = ['curl', '-s', '-o', '-', '-w', '%{http_code}', 
+                   '-H', f'x-apikey: {self.api_key}', 
+                   f'https://www.virustotal.com/api/v3/files/{self.file_hash}']
+            
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            
+            # --- NETWORK ERROR HANDLING ---
+            # If stdout is empty, curl failed completely
+            if len(proc.stdout) < 3:
+                raise Exception("Connection Failed. Check your internet.")
+                
+            code = proc.stdout[-3:]   # Last 3 chars are HTTP code
+            body = proc.stdout[:-3]   # Rest is JSON
+            
+            if code == "000":
+                raise Exception("<b>No Internet Connection</b>\n\nCould not reach VirusTotal.\nPlease check your Wi-Fi or Ethernet.")
+            elif code == "200":
+                self.update_status("Report Found...", 1.0)
+                time.sleep(0.5)
+                self.show_results(json.loads(body))
+            elif code == "404":
+                GLib.idle_add(self.ask_upload)
+            elif code == "401" or code == "403":
+                GLib.idle_add(self.show_error, "Authentication Failed", "Your API Key was rejected.", "setup")
+            else:
+                # Try to read error from JSON if possible
+                try:
+                    err_msg = json.loads(body)['error']['message']
+                    raise Exception(f"API Error: {err_msg}")
+                except:
+                    raise Exception(f"Server Error (HTTP {code})")
+
+        except Exception as e:
+            if not self.abort_flag:
+                GLib.idle_add(self.show_error, "Scan Failed", str(e), "setup")
+
+    def ask_upload(self):
+        dialog = Adw.MessageDialog(
+            heading="Unknown File",
+            body=f"This file has not been seen before.\nHash: {self.file_hash[:8]}...\n\nUpload for analysis?"
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("upload", "Upload")
+        dialog.set_response_appearance("upload", Adw.ResponseAppearance.SUGGESTED)
+        
+        dialog.set_transient_for(self.win)
+        dialog.connect("response", self.on_upload_response)
+        dialog.present()
+
+    def on_upload_response(self, dialog, response):
+        if response == "upload":
+            self.stack.set_visible_child_name("progress")
+            threading.Thread(target=self.run_upload_thread).start()
+        else:
+            self.quit()
+
+    def run_upload_thread(self):
+        try:
+            self.update_status("Uploading File...", 0.6)
+            
+            cmd = [
+                'curl', '--request', 'POST', '--url', 'https://www.virustotal.com/api/v3/files',
+                '--header', f'x-apikey: {self.api_key}',
+                '--form', f'file=@{FILE_PATH}',
+                '-s'
+            ]
+            
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            resp = json.loads(proc.stdout)
+            
+            if 'error' in resp:
+                raise Exception(resp['error']['message'])
+                
+            self.analysis_id = resp['data']['id']
+            self.wait_for_analysis()
+            
+        except Exception as e:
+            GLib.idle_add(self.show_error, "Upload Error", str(e), "setup")
+
+    def wait_for_analysis(self):
+        status = "queued"
+        start_time = time.time()
+        
+        while status != "completed":
+            if self.abort_flag: return
+            elapsed = int(time.time() - start_time)
+            
+            self.update_status(f"Analyzing in Cloud...\n{elapsed}s elapsed\nStatus: {status}", 0.8)
+            
+            time.sleep(5)
+            if time.time() - start_time > 300: raise Exception("Timeout")
+            
+            cmd = ['curl', '-s', '-H', f'x-apikey: {self.api_key}', 
+                   f'https://www.virustotal.com/api/v3/analyses/{self.analysis_id}']
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            data = json.loads(proc.stdout)
+            status = data['data']['attributes']['status']
+            
+        self.update_status("Finalizing...", 1.0)
+        cmd = ['curl', '-s', '-H', f'x-apikey: {self.api_key}', 
+               f'https://www.virustotal.com/api/v3/files/{self.file_hash}']
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        self.show_results(json.loads(proc.stdout))
+
+    def show_results(self, data):
+        attr = data['data']['attributes']
+        stats = attr['last_analysis_stats']
+        malicious = stats['malicious']
+        total = stats['harmless'] + stats['undetected'] + malicious
+        
+        ts = attr.get('last_analysis_date', 0)
+        date_str = datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M')
+        
+        GLib.idle_add(self.update_result_ui, malicious, total, date_str)
+
+    def update_result_ui(self, malicious, total, date_str):
+        self.spinner.stop()
+        self.stack.set_visible_child_name("result")
+        
+        self.row_malicious.set_subtitle(str(malicious))
+        self.row_total.set_subtitle(str(total))
+        self.row_date.set_subtitle(date_str)
+        
+        if malicious > 0:
+            self.page_result.set_icon_name("security-high-symbolic")
+            self.page_result.set_title("Threat Detected")
+            self.page_result.set_description(f"{malicious} / {total} vendors flagged this file.")
+            self.btn_view.add_css_class("destructive-action")
+            self.row_malicious.add_css_class("error")
+        else:
+            self.page_result.set_icon_name("security-low-symbolic")
+            self.page_result.set_title("Clean")
+            self.page_result.set_description(f"No threats found.")
+            self.btn_view.add_css_class("suggested-action")
+            self.row_malicious.remove_css_class("error")
+
+    def on_view_report(self, btn):
+        subprocess.Popen(['xdg-open', f"https://www.virustotal.com/gui/file/{self.file_hash}"])
+        self.quit()
+        
+    def on_rescan(self, btn):
+        self.stack.set_visible_child_name("progress")
+        self.update_status("Requesting Re-scan...", 0.2)
+        threading.Thread(target=self.run_rescan).start()
+
+    def run_rescan(self):
+        try:
+            time.sleep(1)
+            cmd = ['curl', '-X', 'POST', '-s', '-H', f'x-apikey: {self.api_key}', 
+                   f'https://www.virustotal.com/api/v3/files/{self.file_hash}/analyse']
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            data = json.loads(proc.stdout)
+            self.analysis_id = data['data']['id']
+            self.wait_for_analysis()
+        except Exception as e:
+            GLib.idle_add(self.show_error, "Rescan Error", str(e), "result")
+
+    def show_error(self, title, msg, retry_target="setup"):
+        self.spinner.stop()
+        self.stack.set_visible_child_name("error")
+        
+        # Humanize technical errors
+        err_str = str(msg)
+        if "subprocess" in err_str or "ImportError" in err_str:
+            title = "System Configuration Error"
+            err_str = "A critical system tool is missing or misconfigured.\n\nTry running:\nsudo dnf install python3-gobject python3-libadwaita"
+        elif "getaddrinfo failed" in err_str:
+            title = "Connection Failed"
+            err_str = "Could not reach VirusTotal.\nPlease check your internet connection."
+            
+        self.page_error.set_title(title)
+        self.lbl_error.set_label(err_str)
+        self.retry_target = retry_target
+
+    def on_retry_clicked(self, btn):
+        if self.retry_target:
+            self.stack.set_visible_child_name(self.retry_target)
+            if self.retry_target == "progress":
+                self.start_scan_flow()
+
+if __name__ == "__main__":
+    app = VirusTotalApp()
+    app.run(None)
+EOF
+
+# --- 5. EXECUTION ---
+python3 "$GUI_SCRIPT" "$FILE_PATH"
+
+# --- 6. CLEANUP ---
+rm -f "$GUI_SCRIPT"
+exit 0

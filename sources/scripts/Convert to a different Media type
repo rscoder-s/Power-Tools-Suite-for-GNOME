@@ -1,0 +1,247 @@
+#!/bin/bash
+
+# ==============================================================================
+# Title:        Universal Media Converter
+# Description:  Batch converter with robust Input Detection and Cleanup.
+# ==============================================================================
+
+# --- 1. SAFEGUARD & SETUP ---
+set -u
+set -o pipefail
+
+# Temp Files
+WORK_DIR=$(mktemp -d /tmp/media_convert.XXXXXX)
+ERR_LOG="${WORK_DIR}/error.log"
+SKIP_LOG="${WORK_DIR}/skip.log"
+ACTIVE_FILE_LOG="${WORK_DIR}/current_file.txt"
+DID_WORK_LOG="${WORK_DIR}/did_work.txt"
+
+# Cleanup Trap
+trap 'rm -rf "$WORK_DIR"' EXIT
+
+# Check Dependencies
+REQUIRED=("zenity" "ffmpeg" "ffprobe" "file" "gio")
+for tool in "${REQUIRED[@]}"; do
+    if ! command -v "$tool" &> /dev/null; then
+        if command -v zenity &> /dev/null; then
+            zenity --error --text="Critical Failure: Missing dependency <b>$tool</b>." --width=300
+        fi
+        exit 1
+    fi
+done
+
+# --- 2. INPUT VALIDATION (Fixed) ---
+# If first argument is empty or unset, assume Standalone Mode.
+if [ -z "${1:-}" ]; then
+    zenity --info \
+    --title="Usage Instructions" \
+    --text="<b><span size='large'>Context Menu Extension</span></b>\n\nThis tool is designed for the Nautilus right-click menu.\n\n<b>How to use:</b>\n1. Select media files.\n2. Right-click -> Scripts -> Convert Media.\n\n<b>Features:</b>\n• HEVC Video & Lossless Audio\n• Guaranteed Cleanup on Cancel\n• Smart Metadata Preservation" \
+    --width=500 \
+    --ok-label="Understood"
+    exit 0
+fi
+
+# --- 3. CATEGORIZATION ---
+FIRST_FILE=""
+# Find first valid file
+for f in "$@"; do
+    if [ -f "$f" ]; then FIRST_FILE="$f"; break; fi
+done
+
+if [ -z "$FIRST_FILE" ]; then
+     # Case: Only folders selected
+     zenity --warning --text="<b>No Files Selected</b>\n\nYou selected only folders. Please select files to convert." --width=400
+     exit 0
+fi
+
+MIME=$(file --brief --mime-type "$FIRST_FILE")
+CATEGORY="unknown"
+
+case "$MIME" in
+    image/*)    CATEGORY="IMAGE" ;;
+    audio/*)    CATEGORY="AUDIO" ;;
+    video/*)    CATEGORY="VIDEO" ;;
+    *) zenity --error --text="Unsupported File Type: $MIME"; exit 1 ;;
+esac
+
+# --- 4. FORMAT SELECTION ---
+HAS_LIBX265=false
+if ffmpeg -v quiet -codecs | grep -q "libx265"; then HAS_LIBX265=true; fi
+HAS_AAC=false
+if ffmpeg -v quiet -codecs | grep -q "aac"; then HAS_AAC=true; fi
+
+ZENITY_ARGS=("--list" "--title=Convert $CATEGORY" "--text=Select output format:" \
+    "--radiolist" "--column=Select" "--column=Format" "--column=Details" "--height=400" "--width=500")
+
+if [ "$CATEGORY" == "IMAGE" ]; then
+    ZENITY_ARGS+=("TRUE" "jpg" "Best Quality (100%)")
+    ZENITY_ARGS+=("FALSE" "png" "Lossless")
+    ZENITY_ARGS+=("FALSE" "webp" "Lossless")
+    ZENITY_ARGS+=("FALSE" "heic" "High Efficiency (HEVC)")
+elif [ "$CATEGORY" == "AUDIO" ]; then
+    ZENITY_ARGS+=("TRUE" "flac" "Lossless (Open Standard)")
+    ZENITY_ARGS+=("FALSE" "alac" "Lossless (Apple .m4a)")
+    ZENITY_ARGS+=("FALSE" "wav" "Uncompressed")
+    ZENITY_ARGS+=("FALSE" "mp3" "Universal (320kbps)")
+    ZENITY_ARGS+=("FALSE" "aac" "Modern (256kbps .m4a)")
+elif [ "$CATEGORY" == "VIDEO" ]; then
+    ZENITY_ARGS+=("TRUE" "mp4" "Modern (HEVC/H.265)")
+    ZENITY_ARGS+=("FALSE" "mkv" "Modern (HEVC/H.265)")
+    ZENITY_ARGS+=("FALSE" "h264" "Legacy (H.264/MP4)")
+    ZENITY_ARGS+=("FALSE" "mp3" "Extract Audio Only")
+fi
+
+TARGET_EXT=$(zenity "${ZENITY_ARGS[@]}")
+if [ -z "${TARGET_EXT:-}" ]; then exit 0; fi
+
+REAL_EXT="$TARGET_EXT"
+if [ "$TARGET_EXT" == "alac" ] || [ "$TARGET_EXT" == "aac" ]; then REAL_EXT="m4a"; fi
+if [ "$TARGET_EXT" == "h264" ]; then REAL_EXT="mp4"; fi
+
+
+# --- 5. BATCH EXECUTION ---
+(
+    # IGNORE SIGPIPE: We handle errors manually
+    trap '' SIGPIPE
+
+    TOTAL=$#
+    CURRENT=0
+    
+    for FILE in "$@"; do
+        ((CURRENT++))
+        
+        if [ -d "$FILE" ]; then 
+            echo "$(basename "$FILE")" >> "$SKIP_LOG"
+            continue 
+        fi
+
+        BASENAME=$(basename "$FILE")
+        FILENAME="${BASENAME%.*}"
+        
+        PROPOSED_OUTPUT="${FILENAME}.${REAL_EXT}"
+        if [ "$FILE" == "$PROPOSED_OUTPUT" ] || [ "$BASENAME" == "$PROPOSED_OUTPUT" ]; then
+            OUTPUT_FILE="${FILENAME}_converted.${REAL_EXT}"
+        else
+            OUTPUT_FILE="$PROPOSED_OUTPUT"
+        fi
+
+        # Update GUI (Check Cancel)
+        PERCENT=$(( 100 * (CURRENT - 1) / TOTAL ))
+        if ! echo "$PERCENT"; then
+            # Zenity Closed -> KILL CHILDREN
+            pkill -P $$
+            # READ DEATH NOTE
+            if [ -s "$ACTIVE_FILE_LOG" ]; then rm -f "$(cat "$ACTIVE_FILE_LOG")"; fi
+            exit 1
+        fi
+        
+        echo "# Processing ($CURRENT/$TOTAL): $BASENAME"
+
+        # --- WRITE DEATH NOTE ---
+        echo "$OUTPUT_FILE" > "$ACTIVE_FILE_LOG"
+        
+        # Mark that we are attempting work
+        touch "$DID_WORK_LOG"
+
+        # --- FFMPEG COMMAND ---
+        CMD=""
+        if [ "$CATEGORY" == "IMAGE" ]; then
+            case "$TARGET_EXT" in
+                jpg)  CMD="ffmpeg -i \"$FILE\" -map_metadata 0 -q:v 1 \"$OUTPUT_FILE\" -y -loglevel error" ;;
+                webp) CMD="ffmpeg -i \"$FILE\" -map_metadata 0 -lossless 1 \"$OUTPUT_FILE\" -y -loglevel error" ;;
+                heic) CMD="ffmpeg -i \"$FILE\" -map_metadata 0 -c:v libx265 -crf 20 -pix_fmt yuv420p \"$OUTPUT_FILE\" -y -loglevel error" ;;
+                *)    CMD="ffmpeg -i \"$FILE\" -map_metadata 0 \"$OUTPUT_FILE\" -y -loglevel error" ;;
+            esac
+        elif [ "$CATEGORY" == "AUDIO" ]; then
+            BASE_AUDIO="-map 0 -map_metadata 0 -id3v2_version 3"
+            case "$TARGET_EXT" in
+                flac) CMD="ffmpeg -i \"$FILE\" $BASE_AUDIO -c:a flac -c:v copy -disposition:v attached_pic \"$OUTPUT_FILE\" -y -loglevel error" ;;
+                alac) CMD="ffmpeg -i \"$FILE\" $BASE_AUDIO -c:a alac -c:v copy -disposition:v attached_pic -movflags +faststart \"$OUTPUT_FILE\" -y -loglevel error" ;;
+                mp3)  CMD="ffmpeg -i \"$FILE\" $BASE_AUDIO -b:a 320k -c:v copy -disposition:v attached_pic \"$OUTPUT_FILE\" -y -loglevel error" ;;
+                aac)  CMD="ffmpeg -i \"$FILE\" $BASE_AUDIO -c:a aac -b:a 256k -c:v copy -disposition:v attached_pic -movflags +faststart \"$OUTPUT_FILE\" -y -loglevel error" ;;
+                wav)  CMD="ffmpeg -i \"$FILE\" -c:a pcm_s16le \"$OUTPUT_FILE\" -y -loglevel error" ;;
+            esac
+        elif [ "$CATEGORY" == "VIDEO" ]; then
+            case "$TARGET_EXT" in
+                mp4|mkv) CMD="ffmpeg -i \"$FILE\" -map_metadata 0 -movflags use_metadata_tags -c:v libx265 -crf 20 -preset medium -tag:v hvc1 -c:a aac -b:a 256k \"$OUTPUT_FILE\" -y -loglevel error" ;;
+                h264)    CMD="ffmpeg -i \"$FILE\" -map_metadata 0 -movflags use_metadata_tags -c:v libx264 -crf 20 -preset medium -c:a aac -b:a 256k \"$OUTPUT_FILE\" -y -loglevel error" ;;
+                mp3)     CMD="ffmpeg -i \"$FILE\" -map_metadata 0 -id3v2_version 3 -vn -b:a 320k \"$OUTPUT_FILE\" -y -loglevel error" ;;
+            esac
+        fi
+
+        # --- EXECUTE ---
+        eval "$CMD 2>> \"$ERR_LOG\" < /dev/null" &
+        PID=$!
+        
+        while kill -0 $PID 2>/dev/null; do 
+            if ! echo "# Processing ($CURRENT/$TOTAL): $BASENAME"; then
+                kill -9 $PID 2>/dev/null
+                rm -f "$OUTPUT_FILE"
+                exit 1
+            fi
+            sleep 0.5 
+        done
+        wait $PID
+        STATUS=$?
+
+        # --- AUDIT ---
+        if [ $STATUS -eq 0 ] && [ -f "$OUTPUT_FILE" ]; then
+            # Clear death note (Safe)
+            > "$ACTIVE_FILE_LOG"
+            
+            TAGS_IN=$(ffprobe -v quiet -show_entries format_tags -of compact=p=0:nk=1 "$FILE" | grep -c "=")
+            TAGS_OUT=$(ffprobe -v quiet -show_entries format_tags -of compact=p=0:nk=1 "$OUTPUT_FILE" | grep -c "=")
+            
+            if [ "$TAGS_OUT" -ge "$TAGS_IN" ]; then
+                gio trash "$FILE"
+            else
+                echo "$BASENAME" >> "${ERR_LOG}_preserved"
+            fi
+        else
+            echo "ERR: $BASENAME failed" >> "$ERR_LOG"
+            [ -f "$OUTPUT_FILE" ] && rm -f "$OUTPUT_FILE"
+            > "$ACTIVE_FILE_LOG"
+        fi
+        
+    done
+    
+    echo "100"
+    echo "# Complete"
+    sleep 0.5
+
+) | zenity --progress --title="Converting Media" --auto-close --width=450
+
+# --- 6. REPORTING ---
+if [ $? -ne 0 ]; then
+    notify-send "Conversion Cancelled" "Process stopped. Partial files removed." -i process-stop
+    exit 0
+fi
+
+# CHECK IF WE DID ANYTHING (Prevents "Success" on empty runs)
+if [ ! -f "$DID_WORK_LOG" ]; then
+    # We didn't process any files (maybe user cancelled or no valid files)
+    exit 0
+fi
+
+# Folder Report
+if [ -s "$SKIP_LOG" ]; then
+    SKIP_COUNT=$(wc -l < "$SKIP_LOG")
+    if [ $SKIP_COUNT -gt 0 ]; then
+         SKIPPED_NAMES=$(head -n 5 "$SKIP_LOG")
+         zenity --info --title="Skipped Items" --text="<b>Skipped $SKIP_COUNT Folders</b>\n\nOnly files can be converted directly.\n<span font-family='monospace'>$SKIPPED_NAMES</span>" --width=400
+    fi
+fi
+
+if [ -s "$ERR_LOG" ]; then
+    RAW_ERR=$(cat "$ERR_LOG")
+    HINT=""
+    if [[ "$RAW_ERR" == *"Unrecognized option"* || "$RAW_ERR" == *"Unknown encoder"* ]]; then
+        HINT="<b>Hint:</b> Your system is missing codecs (HEVC/AAC). Install 'ffmpeg' via RPMFusion."
+    elif [[ "$RAW_ERR" == *"muxer not found"* ]]; then
+        HINT="<b>Hint:</b> HEIC write support is missing (libheif)."
+    fi
+    ERROR_DETAILS=$(tail -n 10 "$ERR_LOG")
+    zenity --warning --title="Conversion Issues" --text="Some files had issues.\n$HINT\n\n<span font-family='monospace'>$ERROR_DETAILS</span>" --width=500
+else
+    notify-send "Success" "Conversion complete." -i video-x-generic
+fi

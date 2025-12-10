@@ -1,0 +1,51 @@
+#!/bin/bash
+
+# ==============================================================================
+# Title:        Root Installer Wrapper
+# Description:  Locates and launches the hidden Python installer from 'sources'.
+# ==============================================================================
+
+# 1. Anchor to the directory where this 'Install' file lives
+ROOT_DIR="$(dirname "$(realpath "$0")")"
+cd "$ROOT_DIR"
+
+# 2. Define paths
+INSTALLER_SCRIPT="$ROOT_DIR/sources/installer.py"
+LOG="/tmp/beam_install_debug.log"
+
+# 3. Pre-flight Check: Is the engine room intact?
+if [ ! -f "$INSTALLER_SCRIPT" ]; then
+    if command -v zenity &> /dev/null; then
+        zenity --error \
+            --title="Corrupt Installer" \
+            --text="<b>Critical Error:</b>\n\nCould not find 'sources/installer.py'.\n\nEnsure you have extracted the entire folder." \
+            --width=400
+    else
+        echo "Error: sources/installer.py missing."
+        read -p "Press Enter..."
+    fi
+    exit 1
+fi
+
+# 4. Launch the Python Installer (Detached)
+#    We launch it pointing to the full path.
+nohup python3 "$INSTALLER_SCRIPT" > "$LOG" 2>&1 &
+PID=$!
+
+# 5. Watchdog (0.5s check for immediate crashes)
+sleep 0.5
+
+if ! kill -0 $PID 2>/dev/null; then
+    # It died instantly. Show the log.
+    if command -v zenity &> /dev/null; then
+        zenity --text-info \
+            --title="Installer Crashed" \
+            --text="The Python installer failed to start.\nError Log:" \
+            --filename="$LOG" \
+            --width=600 --height=400
+    fi
+    exit 1
+fi
+
+# 6. Success. Vanish.
+exit 0

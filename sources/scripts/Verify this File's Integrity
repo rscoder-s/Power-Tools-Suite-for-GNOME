@@ -1,0 +1,143 @@
+#!/bin/bash
+
+# ==============================================================================
+# Title:        Integrity Verifier
+# Description:  Calculates SHA256 hashes for selected files.
+#               Automatically compares against clipboard content if available.
+# ==============================================================================
+
+# --- 1. PRE-FLIGHT CHECKS ---
+if ! command -v zenity &> /dev/null; then
+    notify-send "Error" "Zenity is missing." -u critical
+    exit 1
+fi
+
+# Context Check
+if [ -z "${1:-}" ]; then
+    zenity --info --text="<b>Usage Instructions</b>\n\nSelect file(s) -> Right Click -> Scripts -> Verify Integrity.\n\n<b>Tip:</b> Copy a hash from a website <i>before</i> running this to auto-verify." --width=400
+    exit 0
+fi
+
+# --- 2. PYTHON LOGIC ---
+PYTHON_SCRIPT=$(mktemp /tmp/verify_integrity.XXXXXX.py)
+trap 'rm -f "$PYTHON_SCRIPT"' EXIT
+
+cat << 'EOF' > "$PYTHON_SCRIPT"
+import sys, os, hashlib, subprocess, re
+
+# --- CONFIG ---
+BLOCK_SIZE = 65536 # 64KB chunks
+
+def get_clipboard():
+    try:
+        # Try xclip or wl-paste (Wayland) if available, else standard command
+        # Simplest universal way in GNOME/Silverblue is likely 'wl-paste' or 'xclip'
+        # But we can try to use zenity to ask the user if we really wanted, 
+        # but let's try reading standard paste buffers.
+        # Fallback: Just return empty string if tools missing.
+        cmd = ['wl-paste'] # Silverblue uses Wayland by default
+        return subprocess.check_output(cmd).decode('utf-8', errors='ignore')
+    except:
+        return ""
+
+def update_progress(percent, text):
+    print(f"{percent}\n# {text}")
+    sys.stdout.flush()
+
+def main():
+    files = sys.argv[1:]
+    total_files = len(files)
+    clipboard_content = get_clipboard().lower()
+    
+    # Clean up clipboard content (remove spaces/newlines for fuzzy matching)
+    # We keep a version with spaces to search for exact lines too.
+    clean_clip = re.sub(r'[^a-f0-9]', '', clipboard_content)
+    
+    results = [] # (Status, Icon, Filename, Hash)
+
+    current_idx = 0
+    
+    for filepath in files:
+        current_idx += 1
+        filename = os.path.basename(filepath)
+        
+        if not os.path.isfile(filepath):
+            results.append(("Skipped", "⚠️", filename, "Not a file"))
+            continue
+
+        file_size = os.path.getsize(filepath)
+        sha256 = hashlib.sha256()
+        
+        # Hashing Loop
+        try:
+            with open(filepath, 'rb') as f:
+                bytes_read = 0
+                while True:
+                    chunk = f.read(BLOCK_SIZE)
+                    if not chunk: break
+                    sha256.update(chunk)
+                    bytes_read += len(chunk)
+                    
+                    # Update Progress per file (weighted)
+                    # This gives a smooth bar for big ISOs
+                    file_percent = (bytes_read / file_size) * 100
+                    total_percent = int(((current_idx - 1) + (bytes_read / file_size)) / total_files * 100)
+                    
+                    # Don't flood stdout
+                    if bytes_read % (BLOCK_SIZE * 100) == 0:
+                        update_progress(total_percent, f"Hashing {filename} ({int(file_percent)}%)")
+                        
+            file_hash = sha256.hexdigest()
+            
+            # --- COMPARISON LOGIC ---
+            status = "Generated"
+            icon = "ℹ️" # Info
+            
+            if not clean_clip:
+                # No clipboard data
+                status = "Hash Only"
+            elif file_hash in clean_clip:
+                # Direct match found
+                status = "MATCH"
+                icon = "✅"
+            else:
+                # Clipboard exists but no match
+                status = "NO MATCH"
+                icon = "❌"
+            
+            results.append((status, icon, filename, file_hash))
+            
+        except Exception as e:
+            results.append(("Error", "⛔", filename, str(e)))
+
+    update_progress(100, "Done")
+    
+    # --- DISPLAY REPORT ---
+    # Construct Zenity List arguments
+    cmd = [
+        'zenity', '--list',
+        '--title=Integrity Report',
+        '--text=Comparison against clipboard data.',
+        '--column=Stat', '--column=Result', '--column=File', '--column=SHA256 Hash',
+        '--width=900', '--height=400'
+    ]
+    
+    for r in results:
+        cmd.extend([r[1], r[0], r[2], r[3]])
+        
+    subprocess.call(cmd)
+
+if __name__ == "__main__":
+    main()
+EOF
+
+# --- 3. EXECUTE ---
+# We pipe the output to Zenity Progress
+python3 "$PYTHON_SCRIPT" "$@" | zenity --progress \
+    --title="Verifying Files" \
+    --auto-close \
+    --width=400
+
+if [ $? -ne 0 ]; then
+    notify-send "Verification Cancelled" -i process-stop
+fi
