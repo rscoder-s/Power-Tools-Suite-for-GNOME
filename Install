@@ -32,8 +32,8 @@ fi
 nohup python3 "$INSTALLER_SCRIPT" > "$LOG" 2>&1 &
 PID=$!
 
-# 5. Watchdog (0.5s check for immediate crashes)
-sleep 0.5
+# 5. Watchdog (0.3s check for immediate crashes)
+sleep 0.3
 
 if ! kill -0 $PID 2>/dev/null; then
     # It died instantly. Show the log.
