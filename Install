@@ -1,51 +1,226 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # ==============================================================================
-# Title:        Root Installer Wrapper
-# Description:  Locates and launches the hidden Python installer from 'sources'.
+# APP:       Installer Launcher (Monitored & Robust)
+# LOGIC:     1. Verbose Logging.
+#            2. Auto-Fix Dependencies.
+#            3. MONITOR the Python process for crashes before exiting.
 # ==============================================================================
 
-# 1. Anchor to the directory where this 'Install' file lives
-ROOT_DIR="$(dirname "$(realpath "$0")")"
-cd "$ROOT_DIR"
+# --- CONFIGURATION ---
+LOG_FILE="/tmp/tools_suite_install.log"
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+SOURCES_DIR="$SCRIPT_DIR/sources"
+INSTALLER_PATH="$SOURCES_DIR/installer.py"
 
-# 2. Define paths
-INSTALLER_SCRIPT="$ROOT_DIR/sources/installer.py"
-LOG="/tmp/beam_install_debug.log"
+# --- LOGGING HELPER ---
+log() {
+    echo "[$(date '+%H:%M:%S')] $1" | tee -a "$LOG_FILE"
+}
 
-# 3. Pre-flight Check: Is the engine room intact?
-if [ ! -f "$INSTALLER_SCRIPT" ]; then
-    if command -v zenity &> /dev/null; then
-        zenity --error \
-            --title="Corrupt Installer" \
-            --text="<b>Critical Error:</b>\n\nCould not find 'sources/installer.py'.\n\nEnsure you have extracted the entire folder." \
-            --width=400
+# Reset Log
+echo "--- Launcher Verbose Log Started ---" > "$LOG_FILE"
+log "Script Directory: $SCRIPT_DIR"
+
+# ==============================================================================
+# 1. DEPENDENCY DEFINITIONS
+# ==============================================================================
+# Pure Python Libraries (User Mode - Pip)
+PIP_DEPS=("mutagen" "requests" "Pillow")
+
+# System Binaries & Bindings (System Mode - Package Manager)
+SYS_CHECKS=("zenity" "ffmpeg" "ffprobe" "pdfinfo" "qrencode" "gs" "fuser" "python3-tk" "python3-gi" "libadwaita" "libgexiv2" "libsecret")
+
+# ==============================================================================
+# 2. DISTRO DETECTION
+# ==============================================================================
+detect_distro() {
+    DISTRO="unknown"
+    CMD_SYS_INSTALL=""
+    PKG_NAMES=""
+    
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        log "OS Detected: ID=$ID, VARIANT=$VARIANT_ID"
+        
+        if [[ "$VARIANT_ID" == "silverblue" || "$VARIANT_ID" == "kinoite" ]]; then
+            DISTRO="silverblue"
+            # Attempt live apply. If this fails, we might need to tell user to reboot.
+            CMD_SYS_INSTALL="rpm-ostree install --apply-live --idempotent"
+            PKG_NAMES="zenity ffmpeg poppler-utils qrencode ghostscript psmisc python3-tkinter python3-gobject libadwaita gtk4 libgexiv2 libsecret python3-mutagen"
+        
+        elif [[ "$ID" == "fedora" || "$ID_LIKE" =~ "fedora" ]]; then
+            DISTRO="fedora"
+            CMD_SYS_INSTALL="dnf install -y"
+            PKG_NAMES="zenity ffmpeg poppler-utils qrencode ghostscript psmisc python3-tkinter python3-gobject libadwaita gtk4 libgexiv2 libsecret python3-mutagen"
+
+        elif [[ "$ID_LIKE" =~ "debian" || "$ID" == "debian" ]]; then
+            DISTRO="debian"
+            CMD_SYS_INSTALL="apt install -y"
+            PKG_NAMES="zenity ffmpeg poppler-utils qrencode ghostscript psmisc python3-tk python3-gi gir1.2-adw-1 gir1.2-gtk-4.0 gir1.2-gexiv2-0.10 gir1.2-secret-1 python3-mutagen"
+            
+        elif [[ "$ID" == "arch" || "$ID_LIKE" =~ "arch" ]]; then
+            DISTRO="arch"
+            CMD_SYS_INSTALL="pacman -S --noconfirm"
+            PKG_NAMES="zenity ffmpeg poppler qrencode ghostscript psmisc tk python-gobject libadwaita gtk4 libgexiv2 libsecret python-mutagen"
+        else
+            log "Warning: Unknown distro. Defaulting to generic names."
+        fi
+    fi
+    log "Distro Profile: $DISTRO"
+}
+detect_distro
+
+# ==============================================================================
+# 3. PHASE 1: USER-LEVEL REPAIR (PIP)
+# ==============================================================================
+log "--- Phase 1: Checking Python User Libraries ---"
+
+for dep in "${PIP_DEPS[@]}"; do
+    if python3 -c "import $dep" &> /dev/null; then
+        log "OK: Python lib '$dep' found."
     else
-        echo "Error: sources/installer.py missing."
-        read -p "Press Enter..."
+        log "MISSING: Python lib '$dep'. Attempting pip install..."
+        if python3 -m pip install --user "$dep" >> "$LOG_FILE" 2>&1; then
+             log "FIXED: Installed '$dep' via pip."
+        else
+             log "FAIL: Could not install '$dep'. Will attempt system install later."
+        fi
     fi
+done
+
+# ==============================================================================
+# 4. PHASE 2: SYSTEM-LEVEL CHECK
+# ==============================================================================
+log "--- Phase 2: Checking System Binaries & Bindings ---"
+
+MISSING_ITEMS=""
+MISSING_COUNT=0
+
+check_component() {
+    NAME=$1
+    # 1. Binary Check
+    if command -v "$NAME" &> /dev/null; then 
+        PATH_FOUND=$(command -v "$NAME")
+        log "OK: Binary '$NAME' found at $PATH_FOUND"
+        return 0
+    fi
+    
+    # 2. Python Binding Check
+    case "$NAME" in
+        "python3-tk") if python3 -c "import tkinter" &> /dev/null; then log "OK: tkinter found."; return 0; fi ;;
+        "python3-gi") if python3 -c "import gi" &> /dev/null; then log "OK: python3-gi found."; return 0; fi ;;
+        "libadwaita") if python3 -c "import gi; gi.require_version('Adw','1')" &> /dev/null; then log "OK: LibAdwaita found."; return 0; fi ;;
+        "libgexiv2")  if python3 -c "import gi; gi.require_version('GExiv2','0.10')" &> /dev/null; then log "OK: GExiv2 found."; return 0; fi ;;
+        "libsecret")  if python3 -c "import gi; gi.require_version('Secret','1')" &> /dev/null; then log "OK: LibSecret found."; return 0; fi ;;
+    esac
+    
+    log "MISSING: '$NAME'"
+    return 1
+}
+
+for item in "${SYS_CHECKS[@]}"; do
+    if ! check_component "$item"; then
+        MISSING_ITEMS="$MISSING_ITEMS\n• $item"
+        ((MISSING_COUNT++))
+    fi
+done
+
+# ==============================================================================
+# 5. PHASE 3: ROOT ESCALATION
+# ==============================================================================
+WAS_INSTALLED=false
+
+if [ $MISSING_COUNT -gt 0 ]; then
+    log "Summary: $MISSING_COUNT system components missing."
+    
+    # Check if Zenity itself is missing
+    if ! command -v zenity &> /dev/null; then
+        log "CRITICAL: Zenity missing. Attempting blind install."
+        if command -v pkexec &> /dev/null; then pkexec $CMD_SYS_INSTALL $PKG_NAMES;
+        elif command -v run0 &> /dev/null; then run0 $CMD_SYS_INSTALL $PKG_NAMES; fi
+        WAS_INSTALLED=true
+    else
+        # Show specific missing list
+        zenity --question \
+            --title="System Dependencies Missing" \
+            --text="The following components are required:\n$MISSING_ITEMS\n\n<b>Install them now?</b>\n(Administrator Password required)" \
+            --width=500
+        
+        if [ $? -eq 0 ]; then
+            log "User accepted install."
+            PRIV="pkexec"
+            if command -v run0 &> /dev/null; then PRIV="run0"; fi
+            
+            INSTALL_STR="$PRIV $CMD_SYS_INSTALL $PKG_NAMES"
+            log "Command: $INSTALL_STR"
+            
+            (
+                echo "10"; echo "# Authenticating..."; sleep 1
+                echo "20"; echo "# Installing packages...";
+                if $INSTALL_STR >> "$LOG_FILE" 2>&1; then
+                    echo "100"; echo "# Success"
+                    log "System install success."
+                else
+                    echo "ERROR"
+                    log "System install failed."
+                    exit 1
+                fi
+            ) | zenity --progress --title="Installing..." --pulsate --auto-close --no-cancel
+            
+            WAS_INSTALLED=true
+        else
+            log "User declined. Exiting."
+            exit 1
+        fi
+    fi
+fi
+
+# ==============================================================================
+# 6. PHASE 4: MONITORED LAUNCH
+# ==============================================================================
+
+if [ ! -f "$INSTALLER_PATH" ]; then
+    log "CRITICAL: installer.py not found at $INSTALLER_PATH"
+    if command -v zenity &> /dev/null; then zenity --error --text="Critical Error: installer.py not found."; fi
     exit 1
 fi
 
-# 4. Launch the Python Installer (Detached)
-#    We launch it pointing to the full path.
-nohup python3 "$INSTALLER_SCRIPT" > "$LOG" 2>&1 &
-PID=$!
+log "--- Phase 4: Launching Installer ---"
+chmod +x "$INSTALLER_PATH"
+cd "$SOURCES_DIR" || { log "Could not cd to sources"; exit 1; }
 
-# 5. Watchdog (0.5s check for immediate crashes)
-sleep 0.5
+# Launch in background, but capture PID
+./installer.py >> "$LOG_FILE" 2>&1 &
+APP_PID=$!
+log "Process launched with PID: $APP_PID"
 
-if ! kill -0 $PID 2>/dev/null; then
-    # It died instantly. Show the log.
-    if command -v zenity &> /dev/null; then
-        zenity --text-info \
+# MONITOR LOOP (The "Don't Vanish" Logic)
+# We watch the process for 5 seconds. If it dies, we know it crashed.
+log "Monitoring process for stability..."
+
+for i in {1..5}; do
+    sleep 1
+    if ! kill -0 $APP_PID 2>/dev/null; then
+        log "CRITICAL: Process $APP_PID died unexpectedly."
+        
+        # Capture the last few lines of the log to show the user
+        ERROR_MSG=$(tail -n 10 "$LOG_FILE")
+        
+        # Special Silverblue Advice
+        ADVICE=""
+        if [ "$WAS_INSTALLED" = true ] && [ "$DISTRO" == "silverblue" ]; then
+            ADVICE="\n\n<b>FEDORA SILVERBLUE NOTICE:</b>\nPackages were installed, but the app crashed.\nThis usually means you must <b>REBOOT</b> to apply the changes."
+        fi
+        
+        zenity --error \
             --title="Installer Crashed" \
-            --text="The Python installer failed to start.\nError Log:" \
-            --filename="$LOG" \
-            --width=600 --height=400
+            --text="The installer failed to start.$ADVICE\n\n<b>Error Log:</b>\n<span font-family='monospace'>$ERROR_MSG</span>" \
+            --width=600
+            
+        exit 1
     fi
-    exit 1
-fi
+done
 
-# 6. Success. Vanish.
+log "Process $APP_PID appears stable (ran for >5s). Launcher exiting."
 exit 0
