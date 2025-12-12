@@ -3,6 +3,7 @@
 # ==============================================================================
 # Title:        File Centre
 # Description:  Modern GNOME file dashboard and utility, to manage a file throughout its lifecycle.
+# License: GPLv2 or later
 # ==============================================================================
 
 # --- 1. BOOTSTRAP LOGGING ---

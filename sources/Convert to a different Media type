@@ -3,6 +3,7 @@
 # ==============================================================================
 # Title:        Universal Media Converter
 # Description:  Batch converter with robust Input Detection and Cleanup.
+# License: GPLv2 or later
 # ==============================================================================
 
 # --- 1. SAFEGUARD & SETUP ---

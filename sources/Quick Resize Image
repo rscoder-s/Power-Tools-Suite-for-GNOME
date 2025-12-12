@@ -3,6 +3,7 @@
 # ==============================================================================
 # Title:        Universal Image Resizer
 # Description:  Batch resizer with Industry Standard Presets.
+# License: GPLv2 or later
 # ==============================================================================
 
 set -u

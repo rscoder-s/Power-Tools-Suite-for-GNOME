@@ -4,6 +4,7 @@
 # Title:        Integrity Verifier
 # Description:  Calculates SHA256 hashes for selected files.
 #               Automatically compares against clipboard content if available.
+# License: GPLv2 or later
 # ==============================================================================
 
 # --- 1. PRE-FLIGHT CHECKS ---

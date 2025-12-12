@@ -3,6 +3,7 @@
 # ==============================================================================
 # Title:        Send Over Local Network (QR)
 # Description:  An end-to-end encrypted file sharing app, optical-airgapped key transfer via QR code, using a sandboxed temporary python server
+# License: GPLv2 or later
 # ==============================================================================
 
 # --- CONFIGURATION ---

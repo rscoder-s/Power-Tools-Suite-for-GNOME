@@ -3,6 +3,7 @@
 # ==============================================================================
 # Title:        VirusTotal Scanner (Online Scan)
 # Description:  Modern GNOME App to scan a file for malware using a valid VirusTotal API key.
+# License: GPLv2 or later
 # ==============================================================================
 
 # --- 1. LOGGING ---

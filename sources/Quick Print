@@ -3,6 +3,7 @@
 # ==============================================================================
 # Title:        Quick Print
 # Description:  Libadwaita Universal Print Dialog with option to choose printers.
+# License: GPLv2 or later
 # ==============================================================================
 
 # --- 1. ERROR LOGGING ---

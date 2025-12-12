@@ -168,3 +168,6 @@ The suite is currently in **alpha**, which means:
 If you want Linux to be more welcoming for everyday users, this project is a great place to contribute. Whether through code, testing, design suggestions, or translations.
 
 * * *
+### License
+This project is licensed under the **GPLv2 or later**.
+See the [LICENSE](LICENSE) file for details.

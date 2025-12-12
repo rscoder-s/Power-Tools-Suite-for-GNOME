@@ -3,6 +3,7 @@
 # ==============================================================================
 # Title:        PDF Merger
 # Description:  Libadwaita GUI to reorder and merge PDFs using Ghostscript.
+# License: GPLv2 or later
 # ==============================================================================
 
 # --- 1. LOGGING ---
