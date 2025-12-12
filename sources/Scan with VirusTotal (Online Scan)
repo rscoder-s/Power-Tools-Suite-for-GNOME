@@ -412,7 +412,7 @@ class VirusTotalApp(Adw.Application):
         self.row_date.set_subtitle(date_str)
         
         if malicious > 0:
-            self.page_result.set_icon_name("security-high-symbolic")
+            self.page_result.set_icon_name("dialog-warning-symbolic")
             self.page_result.set_title("Threat Detected")
             self.page_result.set_description(f"{malicious} / {total} vendors flagged this file.")
             self.btn_view.add_css_class("destructive-action")
