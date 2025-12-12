@@ -1,226 +1,300 @@
-#!/usr/bin/env bash
+#!/usr/bin/env python3
+import sys
+import os
+import shutil
+import subprocess
+import threading
+import datetime
 
-# ==============================================================================
-# APP:       Installer Launcher (Monitored & Robust)
-# LOGIC:     1. Verbose Logging.
-#            2. Auto-Fix Dependencies.
-#            3. MONITOR the Python process for crashes before exiting.
-# ==============================================================================
+# --- 0. DETACH FROM TERMINAL LOGIC ---
+# If we are running in a terminal, spawn a detached background process and exit.
+# This makes the terminal window close immediately while the GUI stays open.
+if os.isatty(sys.stdin.fileno()):
+    # Re-run this script using nohup logic, completely detached
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True
+    )
+    sys.exit(0)
+
+# --- PRE-FLIGHT DEPENDENCY CHECK ---
+# If Libadwaita is missing, we must warn the user before crashing.
+try:
+    import gi
+    gi.require_version('Gtk', '4.0')
+    gi.require_version('Adw', '1')
+    from gi.repository import Gtk, Adw, GLib, Gio
+except ValueError:
+    # If we are here, the system is missing the GUI libraries.
+    # We try to use Zenity to show an error since GTK failed.
+    subprocess.run([
+        "zenity", "--error", 
+        "--text=<b>Critical Error:</b>\n\nMissing 'python3-libadwaita'.\nThe installer cannot run without it.\n\nPlease run:\n<tt>sudo dnf install python3-libadwaita</tt>", 
+        "--width=400"
+    ])
+    sys.exit(1)
+except ImportError:
+    # Fallback for non-GTK systems
+    print("Error: Python GObject/GTK not found.")
+    sys.exit(1)
+
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+from gi.repository import Gtk, Adw, GLib, Gio
 
 # --- CONFIGURATION ---
-LOG_FILE="/tmp/tools_suite_install.log"
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
-SOURCES_DIR="$SCRIPT_DIR/sources"
-INSTALLER_PATH="$SOURCES_DIR/installer.py"
+BEAM_FILENAME = "Send over Local Network (QR)"
+APP_ID = "com.secure.beam.installer"
 
-# --- LOGGING HELPER ---
-log() {
-    echo "[$(date '+%H:%M:%S')] $1" | tee -a "$LOG_FILE"
-}
-
-# Reset Log
-echo "--- Launcher Verbose Log Started ---" > "$LOG_FILE"
-log "Script Directory: $SCRIPT_DIR"
-
-# ==============================================================================
-# 1. DEPENDENCY DEFINITIONS
-# ==============================================================================
-# Pure Python Libraries (User Mode - Pip)
-PIP_DEPS=("mutagen" "requests" "Pillow")
-
-# System Binaries & Bindings (System Mode - Package Manager)
-SYS_CHECKS=("zenity" "ffmpeg" "ffprobe" "pdfinfo" "qrencode" "gs" "fuser" "python3-tk" "python3-gi" "libadwaita" "libgexiv2" "libsecret")
-
-# ==============================================================================
-# 2. DISTRO DETECTION
-# ==============================================================================
-detect_distro() {
-    DISTRO="unknown"
-    CMD_SYS_INSTALL=""
-    PKG_NAMES=""
-    
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        log "OS Detected: ID=$ID, VARIANT=$VARIANT_ID"
+class InstallerApp(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID)
+        self.script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.source_dir = os.path.join(self.script_dir, "sources")
         
-        if [[ "$VARIANT_ID" == "silverblue" || "$VARIANT_ID" == "kinoite" ]]; then
-            DISTRO="silverblue"
-            # Attempt live apply. If this fails, we might need to tell user to reboot.
-            CMD_SYS_INSTALL="rpm-ostree install --apply-live --idempotent"
-            PKG_NAMES="zenity ffmpeg poppler-utils qrencode ghostscript psmisc python3-tkinter python3-gobject libadwaita gtk4 libgexiv2 libsecret python3-mutagen"
-        
-        elif [[ "$ID" == "fedora" || "$ID_LIKE" =~ "fedora" ]]; then
-            DISTRO="fedora"
-            CMD_SYS_INSTALL="dnf install -y"
-            PKG_NAMES="zenity ffmpeg poppler-utils qrencode ghostscript psmisc python3-tkinter python3-gobject libadwaita gtk4 libgexiv2 libsecret python3-mutagen"
+        # Paths
+        home = os.path.expanduser("~")
+        self.nautilus_dir = os.path.join(home, ".local/share/nautilus/sources")
+        self.app_dir = os.path.join(home, ".local/share/applications")
+        self.bin_dir = os.path.join(home, ".local/bin")
+        self.backup_dir = os.path.join(self.nautilus_dir, f"Backup_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}")
 
-        elif [[ "$ID_LIKE" =~ "debian" || "$ID" == "debian" ]]; then
-            DISTRO="debian"
-            CMD_SYS_INSTALL="apt install -y"
-            PKG_NAMES="zenity ffmpeg poppler-utils qrencode ghostscript psmisc python3-tk python3-gi gir1.2-adw-1 gir1.2-gtk-4.0 gir1.2-gexiv2-0.10 gir1.2-secret-1 python3-mutagen"
+    def do_activate(self):
+        win = Adw.ApplicationWindow(application=self)
+        win.set_title("Tool Suite Installer")
+        win.set_default_size(500, 650)
+        
+        # Main Layout (Toast Overlay -> Toolbar View)
+        self.toast_overlay = Adw.ToastOverlay()
+        win.set_content(self.toast_overlay)
+        
+        toolbar_view = Adw.ToolbarView()
+        self.toast_overlay.set_child(toolbar_view)
+        
+        header = Adw.HeaderBar()
+        toolbar_view.add_top_bar(header)
+        
+        # Scrollable Content
+        page = Adw.PreferencesPage()
+        toolbar_view.set_content(page)
+        
+        # --- HERO SECTION ---
+        group_hero = Adw.PreferencesGroup()
+        page.add(group_hero)
+        
+        hero_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        hero_box.set_margin_top(20)
+        hero_box.set_margin_bottom(10)
+        
+        icon = Gtk.Image.new_from_icon_name("system-software-install")
+        icon.set_pixel_size(96)
+        icon.add_css_class("accent") 
+        hero_box.append(icon)
+        
+        title = Gtk.Label(label="Install Tool Suite", css_classes=["title-1"])
+        hero_box.append(title)
+        
+        desc = Gtk.Label(label="Select the components you wish to install.", css_classes=["body"])
+        hero_box.append(desc)
+        
+        # Wrap hero in a row just for layout
+        row_hero = Adw.ActionRow()
+        row_hero.set_child(hero_box)
+        group_hero.add(row_hero)
+
+        # --- SCRIPTS LIST ---
+        self.group_scripts = Adw.PreferencesGroup(title="Nautilus Context Menu Scripts")
+        page.add(self.group_scripts)
+        
+        # Scan for scripts
+        self.script_switches = {}
+        if os.path.exists(self.source_dir):
+            for f in sorted(os.listdir(self.source_dir)):
+                full_path = os.path.join(self.source_dir, f)
+                # Check for Shebang to ensure it's a script
+                if os.path.isfile(full_path):
+                    with open(full_path, 'rb') as script_file:
+                        try:
+                            if script_file.read(2) == b'#!':
+                                self.add_script_row(f)
+                        except: pass
+        else:
+            self.show_toast(f"Error: 'sources' folder not found in {self.script_dir}")
+
+        # --- APP SECTION ---
+        group_app = Adw.PreferencesGroup(title="System Applications")
+        page.add(group_app)
+        
+        # Secure Beam App Toggle
+        self.beam_switch = Gtk.Switch()
+        self.beam_switch.set_active(False)
+        self.beam_switch.set_valign(Gtk.Align.CENTER)
+        
+        row_beam = Adw.ActionRow(title="Secure Beam App")
+        row_beam.set_subtitle("Add 'Send over Local Network' to App Grid and Dock")
+        row_beam.add_suffix(self.beam_switch)
+        
+        # FIX 1: set_icon_name is deprecated. Use add_prefix with GtkImage.
+        beam_icon = Gtk.Image.new_from_icon_name("network-wireless-hotspot")
+        row_beam.add_prefix(beam_icon)
+        
+        group_app.add(row_beam)
+        
+        # If secure beam script exists in source, default to checked
+        if BEAM_FILENAME in self.script_switches:
+            self.beam_switch.set_active(True)
+
+        # --- INSTALL BUTTON ---
+        self.btn_install = Gtk.Button(label="Install Selected")
+        self.btn_install.add_css_class("suggested-action")
+        self.btn_install.add_css_class("pill")
+        self.btn_install.set_margin_top(20)
+        self.btn_install.set_margin_bottom(20)
+        self.btn_install.set_halign(Gtk.Align.CENTER)
+        self.btn_install.connect("clicked", self.on_install_clicked)
+        
+        # Spinner (Hidden by default)
+        self.spinner = Gtk.Spinner()
+        self.spinner.set_margin_top(20)
+        
+        # Bottom Box
+        bottom_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        bottom_box.append(self.btn_install)
+        bottom_box.append(self.spinner)
+        
+        group_btn = Adw.PreferencesGroup()
+        group_btn.add(bottom_box)
+        page.add(group_btn)
+
+        win.present()
+
+    def add_script_row(self, filename):
+        row = Adw.ActionRow(title=filename)
+        
+        # Check if update
+        installed_path = os.path.join(self.nautilus_dir, filename)
+        if os.path.exists(installed_path):
+            row.set_subtitle("Update (Already installed)")
+        
+        switch = Gtk.Switch()
+        switch.set_active(True) # Default on
+        switch.set_valign(Gtk.Align.CENTER)
+        
+        row.add_suffix(switch)
+        self.group_scripts.add(row)
+        self.script_switches[filename] = switch
+
+    def show_toast(self, message):
+        toast = Adw.Toast.new(message)
+        self.toast_overlay.add_toast(toast)
+
+    def on_install_clicked(self, btn):
+        # 1. Disable UI
+        self.btn_install.set_sensitive(False)
+        for s in self.script_switches.values(): s.set_sensitive(False)
+        self.beam_switch.set_sensitive(False)
+        
+        # 2. Start Spinner
+        self.spinner.start()
+        
+        # 3. Gather Tasks
+        to_install_scripts = [name for name, sw in self.script_switches.items() if sw.get_active()]
+        install_beam_app = self.beam_switch.get_active()
+        
+        # 4. Run in Thread
+        thread = threading.Thread(target=self.run_installation, args=(to_install_scripts, install_beam_app))
+        thread.start()
+
+    def run_installation(self, scripts, beam_app):
+        try:
+            # Create Dirs
+            os.makedirs(self.nautilus_dir, exist_ok=True)
+            os.makedirs(self.app_dir, exist_ok=True)
+            os.makedirs(self.bin_dir, exist_ok=True)
             
-        elif [[ "$ID" == "arch" || "$ID_LIKE" =~ "arch" ]]; then
-            DISTRO="arch"
-            CMD_SYS_INSTALL="pacman -S --noconfirm"
-            PKG_NAMES="zenity ffmpeg poppler qrencode ghostscript psmisc tk python-gobject libadwaita gtk4 libgexiv2 libsecret python-mutagen"
-        else
-            log "Warning: Unknown distro. Defaulting to generic names."
-        fi
-    fi
-    log "Distro Profile: $DISTRO"
-}
-detect_distro
+            # Install Scripts
+            for script_name in scripts:
+                src = os.path.join(self.source_dir, script_name)
+                dest = os.path.join(self.nautilus_dir, script_name)
+                
+                # Backup
+                if os.path.exists(dest):
+                    os.makedirs(self.backup_dir, exist_ok=True)
+                    shutil.move(dest, self.backup_dir)
+                
+                # Copy
+                shutil.copy2(src, dest)
+                os.chmod(dest, 0o755)
 
-# ==============================================================================
-# 3. PHASE 1: USER-LEVEL REPAIR (PIP)
-# ==============================================================================
-log "--- Phase 1: Checking Python User Libraries ---"
+            # Install Beam App
+            if beam_app and BEAM_FILENAME in scripts:
+                src = os.path.join(self.source_dir, BEAM_FILENAME)
+                dest_bin = os.path.join(self.bin_dir, "secure-beam")
+                
+                # Copy Binary
+                shutil.copy2(src, dest_bin)
+                os.chmod(dest_bin, 0o755)
+                
+                # Create .desktop
+                desktop_content = f"""[Desktop Entry]
+Type=Application
+Name=Send over Local Network
+Comment=Secure, Encrypted Local File Transfer
+Exec="{dest_bin}" %F
+Icon=network-wireless-hotspot
+Terminal=false
+Categories=Network;Utility;FileTransfer;
+StartupNotify=true
+MimeType=application/octet-stream;
+"""
+                desktop_path = os.path.join(self.app_dir, "secure-beam.desktop")
+                with open(desktop_path, "w") as f:
+                    f.write(desktop_content)
+                os.chmod(desktop_path, 0o755)
 
-for dep in "${PIP_DEPS[@]}"; do
-    if python3 -c "import $dep" &> /dev/null; then
-        log "OK: Python lib '$dep' found."
-    else
-        log "MISSING: Python lib '$dep'. Attempting pip install..."
-        if python3 -m pip install --user "$dep" >> "$LOG_FILE" 2>&1; then
-             log "FIXED: Installed '$dep' via pip."
-        else
-             log "FAIL: Could not install '$dep'. Will attempt system install later."
-        fi
-    fi
-done
-
-# ==============================================================================
-# 4. PHASE 2: SYSTEM-LEVEL CHECK
-# ==============================================================================
-log "--- Phase 2: Checking System Binaries & Bindings ---"
-
-MISSING_ITEMS=""
-MISSING_COUNT=0
-
-check_component() {
-    NAME=$1
-    # 1. Binary Check
-    if command -v "$NAME" &> /dev/null; then 
-        PATH_FOUND=$(command -v "$NAME")
-        log "OK: Binary '$NAME' found at $PATH_FOUND"
-        return 0
-    fi
-    
-    # 2. Python Binding Check
-    case "$NAME" in
-        "python3-tk") if python3 -c "import tkinter" &> /dev/null; then log "OK: tkinter found."; return 0; fi ;;
-        "python3-gi") if python3 -c "import gi" &> /dev/null; then log "OK: python3-gi found."; return 0; fi ;;
-        "libadwaita") if python3 -c "import gi; gi.require_version('Adw','1')" &> /dev/null; then log "OK: LibAdwaita found."; return 0; fi ;;
-        "libgexiv2")  if python3 -c "import gi; gi.require_version('GExiv2','0.10')" &> /dev/null; then log "OK: GExiv2 found."; return 0; fi ;;
-        "libsecret")  if python3 -c "import gi; gi.require_version('Secret','1')" &> /dev/null; then log "OK: LibSecret found."; return 0; fi ;;
-    esac
-    
-    log "MISSING: '$NAME'"
-    return 1
-}
-
-for item in "${SYS_CHECKS[@]}"; do
-    if ! check_component "$item"; then
-        MISSING_ITEMS="$MISSING_ITEMS\n• $item"
-        ((MISSING_COUNT++))
-    fi
-done
-
-# ==============================================================================
-# 5. PHASE 3: ROOT ESCALATION
-# ==============================================================================
-WAS_INSTALLED=false
-
-if [ $MISSING_COUNT -gt 0 ]; then
-    log "Summary: $MISSING_COUNT system components missing."
-    
-    # Check if Zenity itself is missing
-    if ! command -v zenity &> /dev/null; then
-        log "CRITICAL: Zenity missing. Attempting blind install."
-        if command -v pkexec &> /dev/null; then pkexec $CMD_SYS_INSTALL $PKG_NAMES;
-        elif command -v run0 &> /dev/null; then run0 $CMD_SYS_INSTALL $PKG_NAMES; fi
-        WAS_INSTALLED=true
-    else
-        # Show specific missing list
-        zenity --question \
-            --title="System Dependencies Missing" \
-            --text="The following components are required:\n$MISSING_ITEMS\n\n<b>Install them now?</b>\n(Administrator Password required)" \
-            --width=500
-        
-        if [ $? -eq 0 ]; then
-            log "User accepted install."
-            PRIV="pkexec"
-            if command -v run0 &> /dev/null; then PRIV="run0"; fi
+            # Post-Install
+            subprocess.run(["update-desktop-database", self.app_dir], stderr=subprocess.DEVNULL)
+            subprocess.run(["nautilus", "-q"], stderr=subprocess.DEVNULL)
             
-            INSTALL_STR="$PRIV $CMD_SYS_INSTALL $PKG_NAMES"
-            log "Command: $INSTALL_STR"
-            
-            (
-                echo "10"; echo "# Authenticating..."; sleep 1
-                echo "20"; echo "# Installing packages...";
-                if $INSTALL_STR >> "$LOG_FILE" 2>&1; then
-                    echo "100"; echo "# Success"
-                    log "System install success."
-                else
-                    echo "ERROR"
-                    log "System install failed."
-                    exit 1
-                fi
-            ) | zenity --progress --title="Installing..." --pulsate --auto-close --no-cancel
-            
-            WAS_INSTALLED=true
-        else
-            log "User declined. Exiting."
-            exit 1
-        fi
-    fi
-fi
+            GLib.idle_add(self.install_success, len(scripts))
 
-# ==============================================================================
-# 6. PHASE 4: MONITORED LAUNCH
-# ==============================================================================
+        except Exception as e:
+            GLib.idle_add(self.install_error, str(e))
 
-if [ ! -f "$INSTALLER_PATH" ]; then
-    log "CRITICAL: installer.py not found at $INSTALLER_PATH"
-    if command -v zenity &> /dev/null; then zenity --error --text="Critical Error: installer.py not found."; fi
-    exit 1
-fi
-
-log "--- Phase 4: Launching Installer ---"
-chmod +x "$INSTALLER_PATH"
-cd "$SOURCES_DIR" || { log "Could not cd to sources"; exit 1; }
-
-# Launch in background, but capture PID
-./installer.py >> "$LOG_FILE" 2>&1 &
-APP_PID=$!
-log "Process launched with PID: $APP_PID"
-
-# MONITOR LOOP (The "Don't Vanish" Logic)
-# We watch the process for 5 seconds. If it dies, we know it crashed.
-log "Monitoring process for stability..."
-
-for i in {1..5}; do
-    sleep 1
-    if ! kill -0 $APP_PID 2>/dev/null; then
-        log "CRITICAL: Process $APP_PID died unexpectedly."
+    def install_success(self, count):
+        self.spinner.stop()
+        self.btn_install.set_sensitive(True)
         
-        # Capture the last few lines of the log to show the user
-        ERROR_MSG=$(tail -n 10 "$LOG_FILE")
+        # FIX 2: Modern Adw.MessageDialog Usage
+        dialog = Adw.MessageDialog(
+            heading="Installation Complete",
+            body=f"Successfully installed {count} scripts.\nNautilus has been restarted.",
+        )
+        dialog.add_response("ok", "OK")
+        dialog.set_response_appearance("ok", Adw.ResponseAppearance.SUGGESTED)
         
-        # Special Silverblue Advice
-        ADVICE=""
-        if [ "$WAS_INSTALLED" = true ] && [ "$DISTRO" == "silverblue" ]; then
-            ADVICE="\n\n<b>FEDORA SILVERBLUE NOTICE:</b>\nPackages were installed, but the app crashed.\nThis usually means you must <b>REBOOT</b> to apply the changes."
-        fi
-        
-        zenity --error \
-            --title="Installer Crashed" \
-            --text="The installer failed to start.$ADVICE\n\n<b>Error Log:</b>\n<span font-family='monospace'>$ERROR_MSG</span>" \
-            --width=600
-            
-        exit 1
-    fi
-done
+        # FIX 3: Attach to window properly to avoid "TypeError"
+        dialog.set_transient_for(self.get_active_window())
+        dialog.present()
 
-log "Process $APP_PID appears stable (ran for >5s). Launcher exiting."
-exit 0
+    def install_error(self, message):
+        self.spinner.stop()
+        self.btn_install.set_sensitive(True)
+        
+        dialog = Adw.MessageDialog(
+            heading="Installation Failed",
+            body=message,
+        )
+        dialog.add_response("close", "Close")
+        dialog.set_response_appearance("close", Adw.ResponseAppearance.DESTRUCTIVE)
+        
+        # FIX 3: Attach to window properly
+        dialog.set_transient_for(self.get_active_window())
+        dialog.present()
+
+if __name__ == "__main__":
+    app = InstallerApp()
+    app.run(sys.argv)
